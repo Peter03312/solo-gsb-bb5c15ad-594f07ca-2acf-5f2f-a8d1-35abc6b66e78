@@ -58,6 +58,42 @@ async function uploadVideo(title, durationMs, fileSize) {
   return json.video;
 }
 
+// ---- 校订版媒体替换测试用：合成最小可解析 MP4（ftyp + mdat + moov>mvhd）----
+function mp4Box(type, payload) {
+  const b = Buffer.alloc(8 + payload.length);
+  b.writeUInt32BE(8 + payload.length, 0);
+  b.write(type, 4, 'latin1');
+  payload.copy(b, 8);
+  return b;
+}
+// 生成含 mvhd（v0：timescale/duration）的 MP4；fill 字节便于区分文件身份
+function makeMp4(durationMs, { timescale = 1000, fill = 64, byte = 0x78, mdatFirst = true } = {}) {
+  const ftyp = mp4Box('ftyp', Buffer.from('isommp42', 'latin1'));
+  const mvhd = Buffer.alloc(100, 0);
+  mvhd.writeUInt32BE(timescale, 12);
+  mvhd.writeUInt32BE(Math.round((durationMs * timescale) / 1000), 16);
+  const moov = mp4Box('moov', mp4Box('mvhd', mvhd));
+  const mdat = mp4Box('mdat', Buffer.alloc(fill, byte));
+  return mdatFirst ? Buffer.concat([ftyp, mdat, moov]) : Buffer.concat([ftyp, moov, mdat]);
+}
+function multipartMedia(fileName, fileBuf) {
+  const boundary = '----mediab' + Math.random().toString(16).slice(2);
+  const head = Buffer.from(
+    `--${boundary}\r\nContent-Disposition: form-data; name="media"; filename="${fileName}"\r\nContent-Type: video/mp4\r\n\r\n`);
+  const tail = Buffer.from(`\r\n--${boundary}--\r\n`);
+  return { body: Buffer.concat([head, fileBuf, tail]), contentType: `multipart/form-data; boundary=${boundary}` };
+}
+async function uploadCandidate(videoId, fileName, fileBuf) {
+  const mp = multipartMedia(fileName, fileBuf);
+  const res = await fetch(`${BASE}/videos/${videoId}/media/candidate`,
+    { method: 'POST', headers: { 'Content-Type': mp.contentType }, body: mp.body });
+  const json = await res.json();
+  return { status: res.status, json };
+}
+async function mediaBytes(url) {
+  return Buffer.from(await (await fetch(url)).arrayBuffer());
+}
+
 async function main() {
   console.log('1. 上传与基本校验');
   const v = await uploadVideo('测试视频', 10000, 256);
@@ -229,6 +265,7 @@ async function main() {
   await speakerNewSegmentTests();
   await speakerTranslationTests();
   await speakerIsolationTests();
+  await mediaRevisionTests();
 
   console.log(`\n结果：${passed} 通过，${failed} 失败`);
   if (failed) process.exit(1);
@@ -2258,12 +2295,248 @@ async function speakerIsolationTests() {
     JSON.stringify(d2.speakers));
 }
 
+// 44. 校订版媒体替换：上传预览 -> 校验 -> 确认；草稿/历史发布各播各的媒体
+async function mediaRevisionTests() {
+  console.log('44. 校订版媒体替换（媒体版次、预览校验、确认乐观锁、历史固定）');
+  const DUR = 10000;
+  const v = await uploadVideo('换媒体', DUR, 96);
+  // 首个媒体版次为 1（回填形态与新上传一致）
+  let detail = (await req('GET', `/videos/${v.id}`)).json;
+  eq('初始媒体版次为 1', detail.media.media_revision, 1);
+  eq('初始 current 为修订号 1', detail.media.current.media_revision, 1);
+  eq('初始无历史版次', detail.media.history, []);
+  eq('初始无候选', detail.media.candidate, null);
+  eq('video 行带 media_revision', detail.video.media_revision, 1);
+
+  // 准备字幕：草稿两段；审校并发布 v1（固定修订号 1）
+  let sA = (await req('POST', `/videos/${v.id}/segments`, { start_ms: 1000, end_ms: 2000, text: '甲' })).json.segment;
+  const sB = (await req('POST', `/videos/${v.id}/segments`, { start_ms: 2000, end_ms: 3000, text: '乙' })).json.segment;
+  await req('POST', `/videos/${v.id}/segments/${sA.id}/review`, { reviewed: true, revision: 1 });
+  await req('POST', `/videos/${v.id}/segments/${sB.id}/review`, { reviewed: true, revision: 1 });
+  const pub1 = await req('POST', `/videos/${v.id}/publish`, {});
+  check('发布 v1 成功', pub1.status === 201, JSON.stringify(pub1.json));
+  eq('v1 固定媒体修订号 1', pub1.json.publication.media_revision, 1);
+  // 记录原文件（修订号 1）字节
+  const oldBuf = await mediaBytes(`${BASE}/videos/${v.id}/media`);
+
+  console.log('44.1 预览解析：文件名/大小/服务端时长，超差与过短判定');
+  // 无法解析的文件 -> 422 unparseable_media 且无候选落库
+  let up = await uploadCandidate(v.id, 'broken.mp4', Buffer.alloc(128, 0xff));
+  check('无法解析 -> 422', up.status === 422 && up.json.error.code === 'unparseable_media', JSON.stringify(up.json));
+  detail = (await req('GET', `/videos/${v.id}`)).json;
+  eq('无法解析不留候选', detail.media.candidate, null);
+
+  // 差 100ms（恰好边界）：允许；候选修订号为 2
+  const mp100 = makeMp4(DUR + 100, { fill: 130, byte: 0xa1 });
+  up = await uploadCandidate(v.id, 'rev-a.mp4', mp100);
+  check('差 100ms 候选 201', up.status === 201, JSON.stringify(up.json));
+  eq('候选预览文件名', up.json.candidate.original_name, 'rev-a.mp4');
+  eq('候选预览大小', up.json.candidate.size_bytes, mp100.length);
+  eq('候选预览服务端时长', up.json.candidate.duration_ms, DUR + 100);
+  eq('候选媒体修订号为 2', up.json.candidate.media_revision, 2);
+  eq('差 100ms 不阻断', up.json.blocked, false);
+  eq('预览带回当前修订号', up.json.current_media_revision, 1);
+
+  // 差 101ms：blocked duration_mismatch（仍返回 200 供展示，但不能确认）
+  const mp101 = makeMp4(DUR + 101, { fill: 140, byte: 0xa2 });
+  up = await uploadCandidate(v.id, 'rev-b.mp4', mp101);
+  check('差 101ms 候选 201 但 blocked', up.status === 201 && up.json.blocked === true, JSON.stringify(up.json));
+  eq('差 101ms 原因', up.json.check.issues.map((i) => i.code), ['duration_mismatch']);
+  // 新候选替换旧候选：旧候选修订号 2 不可再确认（墓碑）
+  eq('替换后当前候选修订号为 3', up.json.candidate.media_revision, 3);
+  let cf = await req('POST', `/videos/${v.id}/media/confirm`, { revision: 2 });
+  check('旧候选修订号确认 -> 409', cf.status === 409 && cf.json.error.code === 'revision_conflict', JSON.stringify(cf.json));
+  eq('409 返回当前媒体状态（仍 1）', cf.json.error.current_media.media_revision, 1);
+  // blocked 候选确认 -> 422，且不切换
+  cf = await req('POST', `/videos/${v.id}/media/confirm`, { revision: 3 });
+  check('超差候选确认 -> 422', cf.status === 422 && cf.json.error.code === 'media_candidate_invalid', JSON.stringify(cf.json));
+  detail = (await req('GET', `/videos/${v.id}`)).json;
+  eq('422 后当前仍为修订号 1', detail.media.media_revision, 1);
+
+  // 短于字幕末端：时长 2500（记录差 7500 -> mismatch；且 2500 < 3000 -> too_short）
+  const mpShort = makeMp4(2500, { fill: 120, byte: 0xa3 });
+  up = await uploadCandidate(v.id, 'short.mp4', mpShort);
+  check('过短候选 blocked', up.status === 201 && up.json.blocked === true);
+  check('过短候选列两项问题', up.json.check.issues.map((i) => i.code).includes('media_too_short')
+    && up.json.check.issues.map((i) => i.code).includes('duration_mismatch'), JSON.stringify(up.json.check.issues));
+
+  // 差 90ms 但短于已发布字幕末端：构造「草稿清空但发布快照到 3000」场景
+  const vT = await uploadVideo('末端判定', DUR, 96);
+  await req('POST', `/videos/${vT.id}/segments`, { start_ms: 8000, end_ms: 9000, text: '长' });
+  let st = (await req('GET', `/videos/${vT.id}`)).json.segments[0];
+  await req('POST', `/videos/${vT.id}/segments/${st.id}/review`, { reviewed: true, revision: 1 });
+  await req('POST', `/videos/${vT.id}/publish`, {});
+  // 草稿片段改到 2000 终点（模拟之后草稿变短）
+  await req('PUT', `/videos/${vT.id}/segments/${st.id}`, { start_ms: 1000, end_ms: 2000, text: '长改', revision: 2 });
+  const mpT = makeMp4(8950, { fill: 100, byte: 0xa4 }); // 与记录差 1050 -> mismatch，且 8950 < 发布末端 9000
+  up = await uploadCandidate(vT.id, 't.mp4', mpT);
+  check('发布末端参与判定', up.json.check.issues.some((i) => i.code === 'media_too_short')
+    && up.json.check.required_end_ms === 9000, JSON.stringify(up.json.check));
+
+  console.log('44.2 确认成功：草稿换新媒体，历史发布仍播旧文件');
+  // 上传差 -50ms 的合法候选（9950ms），覆盖 3000ms 末端
+  const mpOk = makeMp4(DUR - 50, { fill: 700, byte: 0x44 });
+  up = await uploadCandidate(v.id, 'rev-final.mp4', mpOk);
+  check('合法候选不阻断', up.status === 201 && up.json.blocked === false, JSON.stringify(up.json));
+  const revNew = up.json.candidate.media_revision;
+  check('新候选修订号继续递增（墓碑占位）', revNew >= 4, `rev=${revNew}`);
+  // 缺少修订号 -> 422
+  cf = await req('POST', `/videos/${v.id}/media/confirm`, {});
+  check('确认缺修订号 -> 422', cf.status === 422 && cf.json.error.code === 'missing_media_revision');
+  // 不存在的修订号 -> 409
+  cf = await req('POST', `/videos/${v.id}/media/confirm`, { revision: 99999 });
+  check('不存在修订号 -> 409 不切换', cf.status === 409 && cf.json.error.code === 'revision_conflict');
+  cf = await req('POST', `/videos/${v.id}/media/confirm`, { revision: revNew });
+  check('确认成功 201', cf.status === 201, JSON.stringify(cf.json).slice(0, 200));
+  eq('确认后当前版次', cf.json.media_revision, revNew);
+  eq('视频记录时长同步为服务端解析值', cf.json.media.current.duration_ms, DUR - 50);
+
+  detail = (await req('GET', `/videos/${v.id}`)).json;
+  eq('GET 详情当前版次更新', detail.video.media_revision, revNew);
+  eq('GET 详情视频时长更新', detail.video.duration_ms, DUR - 50);
+  eq('旧版次进入历史', detail.media.history.map((h) => h.media_revision), [1]);
+  eq('历史版次 1 被 v1 发布固定', detail.media.history[0].used_by_versions, [1]);
+  eq('确认后无候选', detail.media.candidate, null);
+
+  // 草稿播放新文件；v1 发布播放旧文件；revision=1 播旧文件
+  const curBuf = await mediaBytes(`${BASE}/videos/${v.id}/media`);
+  const v1Buf = await mediaBytes(`${BASE}/videos/${v.id}/media/history?publication=1`);
+  const rev1Buf = await mediaBytes(`${BASE}/videos/${v.id}/media/history?revision=1`);
+  check('草稿播放新文件', curBuf.length === mpOk.length && curBuf[28] === 0x44,
+    `len=${curBuf.length} byte=${curBuf[28]}`);
+  check('v1 发布仍播旧文件', v1Buf.length === oldBuf.length && v1Buf[28] === oldBuf[28],
+    `len=${v1Buf.length}/${oldBuf.length}`);
+  check('?revision=1 播旧文件', rev1Buf.length === oldBuf.length);
+  const hdr = await fetch(`${BASE}/videos/${v.id}/media`);
+  eq('媒体响应带 X-Media-Revision', hdr.headers.get('x-media-revision'), String(revNew));
+  // Range 仍可用
+  const rr = await fetch(`${BASE}/videos/${v.id}/media`, { headers: { Range: 'bytes=0-31' } });
+  eq('新媒体 Range 206', rr.status, 206);
+  eq('新媒体 Range 长度', (await rr.arrayBuffer()).byteLength, 32);
+
+  console.log('44.3 换媒体不动字幕/译文/审校/质检/说话人及其修订号');
+  detail = (await req('GET', `/videos/${v.id}`)).json;
+  eq('片段文本不变', detail.segments.map((s) => s.text), ['甲', '乙']);
+  eq('片段修订号不变', detail.segments.map((s) => s.revision), [2, 2]);
+  eq('审校状态不变（仍已审）', detail.segments.map((s) => s.reviewed), [true, true]);
+  // 译文：先启用轨道补译文（媒体替换已发生；确认译文与修订号不受影响）
+  const vt = await uploadVideo('换媒体译文', DUR, 96);
+  const tseg = (await req('POST', `/videos/${vt.id}/segments`, { start_ms: 1000, end_ms: 2000, text: '原文' })).json.segment;
+  await req('PUT', `/videos/${vt.id}/translation/track`, { language: 'en' });
+  await req('PUT', `/videos/${vt.id}/segments/${tseg.id}/translation`, { text: 'Source', segment_revision: 1 });
+  const trUp = await req('PUT', `/videos/${vt.id}/segments/${tseg.id}/translation`,
+    { text: 'Source!', segment_revision: 1, revision: 1 });
+  eq('换媒体前译文修订号为 2', trUp.json.translation.revision, 2);
+  up = await uploadCandidate(vt.id, 'm.mp4', makeMp4(DUR + 10, { fill: 88, byte: 0xc1 }));
+  await req('POST', `/videos/${vt.id}/media/confirm`, { revision: up.json.candidate.media_revision });
+  detail = (await req('GET', `/videos/${vt.id}`)).json;
+  eq('换媒体后译文文本不变', detail.translations[0].text, 'Source!');
+  eq('换媒体后译文修订号不变', detail.translations[0].revision, 2);
+  eq('换媒体后原文修订号不变', detail.segments[0].revision, 1);
+  // SRT 草稿语义不变
+  const srt = await (await fetch(`${BASE}/videos/${v.id}/srt?version=draft`)).text();
+  check('草稿 SRT 仍是原字幕', /甲/.test(srt) && /乙/.test(srt), srt);
+  const srtV1 = await (await fetch(`${BASE}/videos/${v.id}/srt?version=1`)).text();
+  check('v1 SRT 不受影响', /甲/.test(srtV1));
+
+  console.log('44.4 后续发布固定新媒体；再次替换形成多版次链');
+  // 当前草稿已审 -> 发布 v2，固定 revNew
+  const pub2 = await req('POST', `/videos/${v.id}/publish`, {});
+  check('发布 v2 成功', pub2.status === 201, JSON.stringify(pub2.json));
+  eq('v2 固定新媒体修订号', pub2.json.publication.media_revision, revNew);
+  // 发布列表回传 media_revision
+  const pl = (await req('GET', `/videos/${v.id}/publications`)).json.publications;
+  eq('发布列表媒体版次', pl.map((p) => [p.version, p.media_revision]), [[2, revNew], [1, 1]]);
+
+  // 再替换一次 -> revNew2；v1 仍固定 1，v2 固定 revNew，草稿用 revNew2
+  const mpOk2 = makeMp4(DUR - 20, { fill: 300, byte: 0x55 });
+  up = await uploadCandidate(v.id, 'rev3.mp4', mpOk2);
+  check('第二次候选 201', up.status === 201);
+  const revNew2 = up.json.candidate.media_revision;
+  check('第二次候选修订号更大', revNew2 > revNew, `${revNew2} > ${revNew}`);
+  cf = await req('POST', `/videos/${v.id}/media/confirm`, { revision: revNew2 });
+  check('第二次确认成功', cf.status === 201);
+  const bDraft = await mediaBytes(`${BASE}/videos/${v.id}/media`);
+  const bV1 = await mediaBytes(`${BASE}/videos/${v.id}/media/history?publication=1`);
+  const bV2 = await mediaBytes(`${BASE}/videos/${v.id}/media/history?publication=2`);
+  check('二次替换后草稿用第三份文件', bDraft[28] === 0x55 && bDraft.length === mpOk2.length);
+  check('v1 仍播放第一份文件', bV1.length === oldBuf.length);
+  check('v2 仍播放第二份文件', bV2.length === mpOk.length);
+  detail = (await req('GET', `/videos/${v.id}`)).json;
+  eq('历史版次为 [1, revNew] 并分别标注使用版本',
+    detail.media.history.map((h) => [h.media_revision, h.used_by_versions]),
+    [[1, [1]], [revNew, [2]]]);
+  // 指定不存在版本号的历史媒体 -> 404
+  const nf = await fetch(`${BASE}/videos/${v.id}/media/history?publication=99`);
+  eq('不存在发布版本媒体 404', nf.status, 404);
+
+  console.log('44.5 候选取消 / 过期自动清理 / 超限拒绝');
+  // 取消
+  up = await uploadCandidate(v.id, 'cancel.mp4', makeMp4(DUR, { fill: 77, byte: 0x66 }));
+  const cancelRev = up.json.candidate.media_revision;
+  let dl = await fetch(`${BASE}/videos/${v.id}/media/candidate`, { method: 'DELETE' });
+  eq('取消候选 200', dl.status, 200);
+  const dj = await dl.json();
+  eq('取消返回 cancelled', dj.cancelled, true);
+  // 再取消幂等
+  dl = await fetch(`${BASE}/videos/${v.id}/media/candidate`, { method: 'DELETE' });
+  eq('无候选再取消幂等 ok=false', (await dl.json()).ok, false);
+  detail = (await req('GET', `/videos/${v.id}`)).json;
+  eq('取消后无候选', detail.media.candidate, null);
+  // 被取消的修订号不能确认（409）也不能播放（422）
+  cf = await req('POST', `/videos/${v.id}/media/confirm`, { revision: cancelRev });
+  check('取消后确认 -> 409', cf.status === 409);
+  const np = await fetch(`${BASE}/videos/${v.id}/media/history?revision=${cancelRev}`);
+  eq('取消版次不可播放 -> 422', np.status, 422);
+
+  // 24 小时（测试为 2.5s）未确认：定时 + 惰性清理；候选消失、文件删除、确认 409
+  up = await uploadCandidate(v.id, 'expire.mp4', makeMp4(DUR, { fill: 70, byte: 0x67 }));
+  const expRev = up.json.candidate.media_revision;
+  const expName = up.json.candidate.original_name;
+  eq('过期前候选存在', up.status, 201);
+  await new Promise((r) => setTimeout(r, 3200)); // 超过 2.5s TTL（巡检间隔 0.5s）
+  detail = (await req('GET', `/videos/${v.id}`)).json;
+  check('候选过期后被自动清理', detail.media.candidate === null, JSON.stringify(detail.media.candidate));
+  cf = await req('POST', `/videos/${v.id}/media/confirm`, { revision: expRev });
+  check('过期候选确认 -> 409 不切换', cf.status === 409 && cf.json.error.current_media.media_revision === revNew2);
+  check('过期候选文件名不再出现', expName === 'expire.mp4');
+  // 候选物理文件已被清理（上传目录不应残留该文件；通过历史接口也取不到）
+  const gone = await fetch(`${BASE}/videos/${v.id}/media/history?revision=${expRev}`);
+  eq('过期版次不可播放', gone.status, 422);
+
+  // 超过 MAX_UPLOAD_MB（测试为 1MB）：422 media_too_large，无候选
+  const over = await uploadCandidate(v.id, 'big.mp4', makeMp4(DUR, { fill: 1100 * 1024, byte: 0x68 }));
+  check('超限候选 -> 422 media_too_large', over.status === 422 && over.json.error.code === 'media_too_large',
+    JSON.stringify(over.json).slice(0, 160));
+  detail = (await req('GET', `/videos/${v.id}`)).json;
+  eq('超限不留候选', detail.media.candidate, null);
+
+  console.log('44.6 删除视频清理全部关联媒体文件');
+  const vd = await uploadVideo('删除媒体', DUR, 50);
+  up = await uploadCandidate(vd.id, 'keep-then-del.mp4', makeMp4(DUR, { fill: 60, byte: 0x69 }));
+  await req('POST', `/videos/${vd.id}/media/confirm`, { revision: up.json.candidate.media_revision });
+  // 再留一个未确认候选（含其物理文件）
+  await uploadCandidate(vd.id, 'pending.mp4', makeMp4(DUR, { fill: 55, byte: 0x6a }));
+  const before = fs.readdirSync(path.join(tmpDir, 'videos')).length;
+  const del = await req('DELETE', `/videos/${vd.id}`);
+  eq('删除视频 204', del.status, 204);
+  // 该视频曾用的全部文件（初始 1 + 已确认 1 + 待确认 1 = 3）都应消失；其他视频文件不受影响
+  const after = fs.readdirSync(path.join(tmpDir, 'videos')).length;
+  eq('删除视频清理 3 个媒体文件（含候选）', before - after, 3);
+  eq('删除后取不到详情', (await req('GET', `/videos/${vd.id}`)).status, 404);
+}
+
 const server = spawn(process.execPath, [path.join(__dirname, '..', 'server.js')], {
   env: {
     ...process.env,
     PORT: String(PORT),
     DB_PATH: path.join(tmpDir, 'test.db'),
     UPLOAD_DIR: path.join(tmpDir, 'videos'),
+    // 媒体候选 2.5 秒即过期（产品默认 24 小时），便于测试自动清理
+    MEDIA_CANDIDATE_TTL_MS: '2500',
+    MEDIA_SWEEP_INTERVAL_MS: '500',
+    // 校订版媒体超限测试：上限 1MB
+    MAX_UPLOAD_MB: '1',
   },
   stdio: ['ignore', 'pipe', 'pipe'],
 });

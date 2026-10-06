@@ -14,6 +14,7 @@ const state = {
   speakers: [],          // 说话人名单（含 usage_count）
   listRevision: 0,       // 所见名单修订号
   unassignedIds: [],     // 未归属片段 ID 清单
+  media: null,           // 媒体版次状态 {media_revision,current,history,candidate}
   activeSegmentId: null,
   editor: null, // { mode:'create'|'edit', segmentId, revision, initialText, dirty }
   shiftSelected: new Set(), // 整体平移勾选的片段 ID
@@ -214,6 +215,7 @@ async function openVideo(id) {
   state.speakers = data.speakers || [];
   state.listRevision = data.list_revision || 0;
   state.unassignedIds = data.unassigned_segment_ids || [];
+  state.media = data.media || null;
   state.activeSegmentId = null;
   state.shiftSelected = new Set();
   render();
@@ -241,7 +243,8 @@ function anyModalOpen() {
          !$('mergeModal').classList.contains('hidden') ||
          !$('trModal').classList.contains('hidden') ||
          !$('qcWaiverModal').classList.contains('hidden') ||
-         !$('qcPubModal').classList.contains('hidden');
+         !$('qcPubModal').classList.contains('hidden') ||
+         !$('mediaModal').classList.contains('hidden');
 }
 async function pollRefresh() {
   if (anyModalOpen() || !state.video) return;
@@ -255,6 +258,8 @@ async function pollRefresh() {
       JSON.stringify((data.speakers || []).map((sp) => [sp.id, sp.name, sp.usage_count]))
         !== JSON.stringify(state.speakers.map((sp) => [sp.id, sp.name, sp.usage_count])) ||
       (data.list_revision || 0) !== state.listRevision;
+    const mediaChanged = !state.media || (data.media && data.media.media_revision !== state.media.media_revision)
+      || JSON.stringify((data.media && data.media.candidate) || null) !== JSON.stringify((state.media && state.media.candidate) || null);
     state.segments = data.segments;
     state.translations = data.translations || [];
     state.translationLang = data.translation_lang != null ? data.translation_lang : null;
@@ -263,11 +268,13 @@ async function pollRefresh() {
     state.unassignedIds = data.unassigned_segment_ids || [];
     state.publications = data.publications;
     state.qcRules = data.qc_rules || null;
+    state.media = data.media || null;
     syncShiftSelected();
     if (changed) {
       renderSegmentDependent();
       toast('检测到他人的修改，已刷新片段列表');
     }
+    if (mediaChanged) renderMediaPanel();
     loadQcReport().then(() => {
       // 正在质检卡片内编辑阈值（焦点位于卡片输入框）时不重绘，避免冲掉未保存的输入
       const ae = document.activeElement;
@@ -308,10 +315,14 @@ function renderDetail() {
     <div class="workbench-grid">
       <div>
         <section class="card">
-          <h2>${esc(v.title)} <span class="meta">时长 ${fmtTime(v.duration_ms)} ｜ 共 ${state.segments.length} 段
+          <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap">
+            <h2 style="margin:0">${esc(v.title)} <span class="meta">时长 ${fmtTime(v.duration_ms)} ｜ 共 ${state.segments.length} 段
             ${allReviewed ? '｜<span style="color:var(--ok)">全部已审</span>' : ''}
             ${state.translationLang ? `｜译文轨道 <b>${esc(state.translationLang)}</b>` : ''}</span></h2>
-          <video id="videoPlayer" controls preload="metadata" src="/api/videos/${v.id}/media"></video>
+            <button class="btn small" id="replaceMediaBtn" title="上传校订版媒体（草稿换用新文件，历史发布保持各自的媒体）">🎞 替换校订版媒体…</button>
+          </div>
+          <p class="meta" id="mediaBadgeLine"></p>
+          <video id="videoPlayer" controls preload="metadata" src="/api/videos/${v.id}/media?rev=${v.media_revision}"></video>
           <div class="subtitle-overlay" id="subtitleOverlay">— 播放时此处显示当前字幕 —</div>
           <div id="timelineContainer"></div>
         </section>
@@ -337,6 +348,7 @@ function renderDetail() {
       </div>
 
       <div>
+        <section class="card" id="mediaCard"></section>
         <section class="card" id="speakersCard"></section>
         <section class="card" id="qcCard"></section>
         <section class="card" id="publishCard"></section>
@@ -348,11 +360,13 @@ function renderDetail() {
   $('importSrtBtn').addEventListener('click', openImportModal);
   $('restoreRangeBtn').addEventListener('click', openRestoreModal);
   $('shiftBtn').addEventListener('click', openShiftModal);
+  $('replaceMediaBtn').addEventListener('click', openMediaModal);
   const videoEl = $('videoPlayer');
   videoEl.addEventListener('timeupdate', onTimeUpdate);
 
   renderTimeline();
   renderSegmentTable();
+  renderMediaPanel();
   renderSpeakerCard();
   renderPublishCard();
   renderQcPanel();
@@ -363,6 +377,7 @@ function renderSegmentDependent() {
   if (state.view !== 'detail') return;
   renderTimeline();
   renderSegmentTable();
+  renderMediaPanel();
   renderSpeakerCard();
   renderPublishCard();
   renderQcPanel();
@@ -804,6 +819,7 @@ async function deleteSegment(seg) {
 
 async function refreshCurrent() {
   const data = await api(`/api/videos/${state.video.id}`);
+  const prevMediaRev = state.media ? state.media.media_revision : null;
   state.segments = data.segments;
   state.publications = data.publications;
   state.translations = data.translations || [];
@@ -812,8 +828,20 @@ async function refreshCurrent() {
   state.speakers = data.speakers || [];
   state.listRevision = data.list_revision || 0;
   state.unassignedIds = data.unassigned_segment_ids || [];
+  state.media = data.media || null;
+  state.video = data.video;
   syncShiftSelected();
   renderSegmentDependent();
+  // 媒体版次变化（如本次确认替换）后：重建 <video> 源以播放新文件
+  if (prevMediaRev !== data.media.media_revision) {
+    const player = $('videoPlayer');
+    if (player) {
+      const wasPlaying = !player.paused;
+      player.src = `/api/videos/${state.video.id}/media?rev=${data.media.media_revision}`;
+      player.load();
+      if (wasPlaying) player.play().catch(() => {});
+    }
+  }
   try { await loadQcReport(); renderQcPanel(); } catch (_) { /* 忽略 */ }
 }
 
@@ -1623,7 +1651,8 @@ function renderPublishCard() {
   const pubList = $('pubList');
   pubList.innerHTML = state.publications.length
     ? '历史发布：' + state.publications
-        .map((p) => `v${p.version}${p.has_translation ? '（双轨）' : ''}${p.has_qc ? '（含质检快照）' : ''}${p.has_speakers ? '（含说话人快照）' : ''} · ${new Date(p.published_at).toLocaleString()} · ${p.segment_count} 段
+        .map((p) => `v${p.version}${p.has_translation ? '（双轨）' : ''}${p.has_qc ? '（含质检快照）' : ''}${p.has_speakers ? '（含说话人快照）' : ''} · 媒体第 ${p.media_revision} 版 · ${new Date(p.published_at).toLocaleString()} · ${p.segment_count} 段
+          <a href="/api/videos/${state.video.id}/media/history?publication=${p.version}" target="_blank" rel="noopener">▶ 播放该版本媒体</a>
           <a href="javascript:void(0)" class="qc-pub-link" data-version="${p.version}">${p.has_qc ? '查看质检快照' : '质检快照（无）'}</a>`)
         .join(' ｜ ')
     : '尚未发布过版本';
@@ -1650,6 +1679,158 @@ async function publishVersion() {
       return;
     }
     toast(`发布失败：${err.message}${suffix}`, true);
+  }
+}
+
+/* ================= 校订版媒体替换 ================= */
+function fmtBytes(n) {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / 1024 / 1024).toFixed(2)} MB`;
+}
+
+function renderMediaPanel() {
+  const card = $('mediaCard');
+  const line = $('mediaBadgeLine');
+  if (!card || !state.media) return;
+  const m = state.media;
+  if (line) {
+    line.innerHTML = `当前草稿媒体：<b>第 ${m.media_revision} 版</b>`
+      + (m.current ? ` ｜ ${esc(m.current.original_name)} ｜ ${fmtBytes(m.current.size_bytes)}`
+        + ` ｜ 服务端时长 ${fmtTime(m.current.duration_ms)}` : '');
+  }
+  const pubByRev = new Map();
+  for (const p of state.publications) {
+    const list = pubByRev.get(p.media_revision) || [];
+    list.push(p);
+    pubByRev.set(p.media_revision, list);
+  }
+  const historyItems = m.history.map((h) => {
+    const pubs = pubByRev.get(h.media_revision) || [];
+    const links = pubs.length
+      ? pubs.map((p) => `<a href="/api/videos/${state.video.id}/media/history?publication=${p.version}" target="_blank" rel="noopener">▶ 播放 v${p.version} 发布时媒体</a>`).join(' ｜ ')
+      : `<a href="/api/videos/${state.video.id}/media/history?revision=${h.media_revision}" target="_blank" rel="noopener">▶ 播放第 ${h.media_revision} 版媒体</a>`;
+    return `<li>第 ${h.media_revision} 版：${esc(h.original_name)}（${fmtBytes(h.size_bytes)}，${fmtTime(h.duration_ms)}）<br/>${links}</li>`;
+  }).join('');
+  card.innerHTML = `
+    <h2>媒体版次</h2>
+    <p class="meta">确认替换后，<b>草稿播放</b>使用最新版媒体；每个历史发布版本继续播放其发布时固定的媒体（首次替换前的旧文件始终保留）；之后发布固定当前新媒体。字幕/译文/审校/质检/说话人及其修订号不随换媒体变化。</p>
+    <p class="meta">当前：<b>第 ${m.media_revision} 版</b>${m.current ? ` — ${esc(m.current.original_name)}（${fmtBytes(m.current.size_bytes)}）` : ''}
+      ｜ <a href="/api/videos/${state.video.id}/media/history?revision=${m.media_revision}" target="_blank" rel="noopener">▶ 在新标签页播放当前草稿媒体</a></p>
+    ${m.candidate ? `<p class="warn">有 1 个待确认候选：第 ${m.candidate.media_revision} 版 — ${esc(m.candidate.original_name)}（24 小时内未确认将自动清理）</p>` : ''}
+    ${historyItems ? `<ul class="media-history">${historyItems}</ul>` : '<p class="meta">尚无历史版次（首次替换后，这里会列出旧文件及历史版本播放入口）。</p>'}`;
+}
+
+const mediaModalState = { candidate: null, busy: false };
+
+function openMediaModal() {
+  mediaModalState.candidate = null;
+  mediaModalState.busy = false;
+  $('mediaFile').value = '';
+  $('mediaUploadMsg').textContent = '';
+  $('mediaError').textContent = '';
+  $('mediaCandidateBox').classList.add('hidden');
+  $('mediaIssueBox').classList.add('hidden');
+  $('mediaConfirmBtn').disabled = true;
+  $('mediaCancelCandidateBtn').disabled = true;
+  const m = state.media;
+  $('mediaCurrentBox').innerHTML = m && m.current
+    ? `当前媒体：<b>第 ${m.media_revision} 版</b> ｜ ${esc(m.current.original_name)} ｜ ${fmtBytes(m.current.size_bytes)} ｜ 记录时长 ${fmtTime(state.video.duration_ms)}`
+    : '';
+  // 打开时若已有候选（例如他人刚上传），直接展示
+  if (m && m.candidate) renderMediaCandidate(m.candidate);
+  $('mediaModal').classList.remove('hidden');
+}
+function closeMediaModal() { $('mediaModal').classList.add('hidden'); }
+
+function renderMediaCandidate(c) {
+  mediaModalState.candidate = c;
+  $('mediaCandidateBox').classList.remove('hidden');
+  const diffText = `与记录相差 ${c.check.diff_ms}ms（允许 ±100ms）`;
+  $('mediaCandidateInfo').innerHTML =
+    `媒体修订号：<b>${c.media_revision}</b>（确认时须携带）<br/>`
+    + `文件名：${esc(c.original_name)}<br/>大小：${fmtBytes(c.size_bytes)}<br/>`
+    + `服务端解析时长：<b>${fmtTime(c.duration_ms)}</b>（${c.duration_ms}ms），${diffText}<br/>`
+    + `字幕要求末端：${c.check.required_end_ms}ms（新文件须不早于该点）`;
+  const box = $('mediaIssueBox');
+  const blocked = !!c.check.blocked;
+  if (blocked) {
+    box.classList.remove('hidden');
+    $('mediaIssueList').innerHTML = c.check.issues.map((i) => `<li>${esc(i.message)}</li>`).join('');
+  } else {
+    box.classList.add('hidden');
+  }
+  $('mediaConfirmBtn').disabled = blocked;
+  $('mediaCancelCandidateBtn').disabled = false;
+}
+
+async function uploadMediaCandidate() {
+  const file = $('mediaFile').files[0];
+  const msg = $('mediaUploadMsg');
+  const errEl = $('mediaError');
+  errEl.textContent = '';
+  if (!file) { errEl.textContent = '请先选择校订版媒体文件'; return; }
+  msg.textContent = `正在上传 ${file.name}（${fmtBytes(file.size)}）并由服务端解析时长…`;
+  mediaModalState.busy = true;
+  $('mediaUploadBtn').disabled = true;
+  try {
+    const fd = new FormData();
+    fd.append('media', file);
+    const data = await api(`/api/videos/${state.video.id}/media/candidate`, { method: 'POST', body: fd });
+    msg.textContent = '';
+    state.media.candidate = data.candidate;
+    state.media.candidate.check = data.check;
+    renderMediaCandidate({ ...data.candidate, check: data.check });
+    toast(data.blocked ? '候选已上传，但时长校验未通过，不能确认' : '候选已上传并解析成功，可确认替换');
+  } catch (e) {
+    msg.textContent = '';
+    errEl.textContent = `上传被拒绝：${e.message}`;
+    $('mediaCandidateBox').classList.add('hidden');
+    $('mediaConfirmBtn').disabled = true;
+    $('mediaCancelCandidateBtn').disabled = true;
+    mediaModalState.candidate = null;
+  } finally {
+    mediaModalState.busy = false;
+    $('mediaUploadBtn').disabled = false;
+  }
+}
+
+async function confirmMediaReplacement() {
+  const c = mediaModalState.candidate;
+  if (!c) return;
+  $('mediaError').textContent = '';
+  $('mediaConfirmBtn').disabled = true;
+  try {
+    await api(`/api/videos/${state.video.id}/media/confirm`, {
+      method: 'POST', body: { revision: c.media_revision },
+    });
+    toast(`已切换到第 ${c.media_revision} 版媒体；历史发布仍播放各自媒体`);
+    closeMediaModal();
+    await refreshCurrent();
+  } catch (e) {
+    $('mediaError').textContent = `确认失败：${e.message}`;
+    // 过期/冲突：刷新当前媒体状态后重新渲染弹窗
+    await refreshCurrent();
+    if (state.media && state.media.candidate) renderMediaCandidate(state.media.candidate);
+    else { $('mediaCandidateBox').classList.add('hidden'); mediaModalState.candidate = null; }
+    $('mediaConfirmBtn').disabled = !(state.media && state.media.candidate && !state.media.candidate.check.blocked);
+  }
+}
+
+async function cancelMediaCandidate() {
+  const c = mediaModalState.candidate || (state.media && state.media.candidate);
+  if (!c) return;
+  $('mediaError').textContent = '';
+  try {
+    await api(`/api/videos/${state.video.id}/media/candidate`, { method: 'DELETE' });
+    toast(`已取消第 ${c.media_revision} 版候选并清理文件`);
+    mediaModalState.candidate = null;
+    $('mediaCandidateBox').classList.add('hidden');
+    $('mediaConfirmBtn').disabled = true;
+    $('mediaCancelCandidateBtn').disabled = true;
+    await refreshCurrent();
+  } catch (e) {
+    $('mediaError').textContent = `取消失败：${e.message}`;
   }
 }
 
@@ -2139,6 +2320,10 @@ $('qcWaiverSave').addEventListener('click', saveQcWaiver);
 $('qcWaiverModal').addEventListener('click', (e) => { if (e.target === $('qcWaiverModal')) closeQcWaiver(); });
 $('qcPubClose').addEventListener('click', () => $('qcPubModal').classList.add('hidden'));
 $('qcPubModal').addEventListener('click', (e) => { if (e.target === $('qcPubModal')) $('qcPubModal').classList.add('hidden'); });
+$('mediaUploadBtn').addEventListener('click', uploadMediaCandidate);
+$('mediaConfirmBtn').addEventListener('click', confirmMediaReplacement);
+$('mediaCancelCandidateBtn').addEventListener('click', cancelMediaCandidate);
+$('mediaModal').addEventListener('click', (e) => { if (e.target === $('mediaModal')) closeMediaModal(); });
 
 /* ================= 启动 ================= */
 loadList().catch((e) => {

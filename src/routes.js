@@ -9,20 +9,48 @@ const { get } = require('./db');
 const { ApiError, isInt, validateTimeline } = require('./validation');
 const { buildSrt, parseSrt } = require('./srt');
 const { buildQcReport, mapQcRules } = require('./qc');
+const { probeDurationMs } = require('./media-probe');
 
 const UPLOAD_DIR = process.env.UPLOAD_DIR || path.join(__dirname, '..', 'data', 'videos');
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
-const upload = multer({
-  storage: multer.diskStorage({
-    destination: (req, file, cb) => cb(null, UPLOAD_DIR),
-    filename: (req, file, cb) => {
-      const ext = path.extname(file.originalname).toLowerCase().replace(/[^.a-z0-9]/g, '');
-      cb(null, `${Date.now()}-${crypto.randomBytes(6).toString('hex')}${ext}`);
-    },
-  }),
-  limits: { fileSize: Number(process.env.MAX_UPLOAD_MB || 2048) * 1024 * 1024 },
-});
+function makeVideoUpload() {
+  return multer({
+    storage: multer.diskStorage({
+      destination: (req, file, cb) => cb(null, UPLOAD_DIR),
+      filename: (req, file, cb) => {
+        const ext = path.extname(file.originalname).toLowerCase().replace(/[^.a-z0-9]/g, '');
+        cb(null, `${Date.now()}-${crypto.randomBytes(6).toString('hex')}${ext}`);
+      },
+    }),
+    limits: { fileSize: Number(process.env.MAX_UPLOAD_MB || 2048) * 1024 * 1024 },
+  });
+}
+
+const upload = makeVideoUpload();
+// 校订版媒体上传统一走 MAX_UPLOAD_MB 上限（与首次上传相同）
+const mediaUpload = makeVideoUpload();
+
+// 候选媒体保留时长：上传后 24 小时未确认自动清理（可用环境变量缩短，仅测试使用）
+const MEDIA_CANDIDATE_TTL_MS = Number(process.env.MEDIA_CANDIDATE_TTL_MS || 24 * 60 * 60 * 1000);
+// 候选清理巡检间隔（默认每小时一次；过期候选在各媒体接口上还会惰性清理）
+const MEDIA_SWEEP_INTERVAL_MS = Number(process.env.MEDIA_SWEEP_INTERVAL_MS || 60 * 60 * 1000);
+
+// multipart 中间件包装：把媒体上传的超限错误转成专用 422（超限文件 multer 已自动清理）
+function mediaUploadSingle(field) {
+  return (req, res, next) => {
+    mediaUpload.single(field)(req, res, (err) => {
+      if (err && err.code === 'LIMIT_FILE_SIZE') {
+        // 防御性清理：个别 multer 版本在磁盘引擎下会保留部分写入的文件
+        if (req.file && req.file.path) fs.promises.unlink(req.file.path).catch(() => {});
+        next(new ApiError(422, 'media_too_large',
+          `校订版媒体超过上传大小上限（MAX_UPLOAD_MB，当前 ${process.env.MAX_UPLOAD_MB || 2048} MB）；候选已拒绝并清理`));
+        return;
+      }
+      next(err);
+    });
+  };
+}
 
 // SRT 文件较小，仅在内存中解析，不落盘
 const MAX_SRT_BYTES = Number(process.env.MAX_SRT_KB || 10240) * 1024;
@@ -71,6 +99,181 @@ function listSegments(videoId) {
     .prepare(`${SEGMENT_SELECT} WHERE s.video_id = ? ORDER BY s.start_ms, s.id`)
     .all(videoId)
     .map(mapSegment);
+}
+
+/* ---------------- 媒体版次（校订版媒体替换） ---------------- */
+
+function mapMediaAsset(row) {
+  return {
+    media_revision: row.media_revision,
+    role: row.role,
+    original_name: row.original_name,
+    mime_type: row.mime_type,
+    size_bytes: row.size_bytes,
+    duration_ms: row.duration_ms,
+    created_at: row.created_at,
+    expires_at: row.expires_at == null ? null : row.expires_at,
+  };
+}
+
+function loadMediaAsset(videoId, mediaRevision) {
+  return get()
+    .prepare('SELECT * FROM media_assets WHERE video_id = ? AND media_revision = ?')
+    .get(videoId, mediaRevision);
+}
+
+function loadCurrentMedia(videoId) {
+  return get()
+    .prepare("SELECT * FROM media_assets WHERE video_id = ? AND role = 'current'")
+    .get(videoId);
+}
+
+function loadCandidateMedia(videoId) {
+  return get()
+    .prepare("SELECT * FROM media_assets WHERE video_id = ? AND role = 'candidate' ORDER BY media_revision DESC LIMIT 1")
+    .get(videoId);
+}
+
+// 候选可确认的必要条件（纯计算；与提交者无关）：
+// 1) 服务端解析时长与视频记录相差不超过 100ms；
+// 2) 解析时长不早于草稿及任一已发布字幕的末端（所有片段终点都落在新文件时长内）。
+function evaluateCandidate(video, candidateRow, { publications } = {}) {
+  const issues = [];
+  const diff = Math.abs(candidateRow.duration_ms - video.duration_ms);
+  const durationOk = diff <= 100;
+  if (!durationOk) {
+    issues.push({
+      code: 'duration_mismatch',
+      parsed_duration_ms: candidateRow.duration_ms,
+      recorded_duration_ms: video.duration_ms,
+      diff_ms: diff,
+      message: `服务端解析时长 ${candidateRow.duration_ms}ms 与视频记录时长 ${video.duration_ms}ms 相差 ${diff}ms，`
+        + '超过允许的 ±100ms，不能确认替换',
+    });
+  }
+
+  const requiredEndMs = requiredSubtitleEndMs(video.id, publications);
+  const covers = candidateRow.duration_ms >= requiredEndMs;
+  if (!covers) {
+    issues.push({
+      code: 'media_too_short',
+      parsed_duration_ms: candidateRow.duration_ms,
+      required_end_ms: requiredEndMs,
+      message: `服务端解析时长 ${candidateRow.duration_ms}ms 早于字幕末端 ${requiredEndMs}ms`
+        + '（草稿或某已发布版本的最后一个片段终点），替换会导致字幕越过媒体，不能确认',
+    });
+  }
+  return { diff_ms: diff, duration_ok: durationOk, required_end_ms: requiredEndMs, covers, blocked: issues.length > 0, issues };
+}
+
+// 草稿片段与全部已发布快照中的最大终点（毫秒）；无字幕时为 0
+function requiredSubtitleEndMs(videoId, publicationsArg) {
+  let maxEnd = 0;
+  for (const s of get().prepare('SELECT end_ms FROM segments WHERE video_id = ?').all(videoId)) {
+    if (s.end_ms > maxEnd) maxEnd = s.end_ms;
+  }
+  const pubs = publicationsArg
+    || get().prepare('SELECT snapshot FROM publications WHERE video_id = ?').all(videoId);
+  for (const p of pubs) {
+    try {
+      for (const e of JSON.parse(p.snapshot)) {
+        if (Number.isFinite(e.end_ms) && e.end_ms > maxEnd) maxEnd = e.end_ms;
+      }
+    } catch (_) { /* 防御：损坏快照忽略 */ }
+  }
+  return maxEnd;
+}
+
+// GET 详情中的媒体状态：当前版次、历史版次（含每个版次被哪些发布固定）与待确认候选
+function mediaState(video) {
+  const dbx = get();
+  const assets = dbx
+    .prepare('SELECT * FROM media_assets WHERE video_id = ? ORDER BY media_revision')
+    .all(video.id);
+  const pubs = dbx
+    .prepare('SELECT version, media_revision, published_at, segment_count, snapshot FROM publications WHERE video_id = ? ORDER BY version')
+    .all(video.id);
+  const usedBy = new Map();
+  for (const p of pubs) {
+    const list = usedBy.get(p.media_revision) || [];
+    list.push(p.version);
+    usedBy.set(p.media_revision, list);
+  }
+  const current = assets.find((a) => a.role === 'current') || null;
+  const candidate = [...assets].reverse().find((a) => a.role === 'candidate') || null;
+  const mapHistory = (a) => ({ ...mapMediaAsset(a), used_by_versions: usedBy.get(a.media_revision) || [] });
+  return {
+    media_revision: video.media_revision,
+    current: current ? mapMediaAsset(current) : null,
+    history: assets.filter((a) => a.role === 'history').map(mapHistory),
+    candidate: candidate
+      ? { ...mapMediaAsset(candidate), check: evaluateCandidate(video, candidate, { publications: pubs }) }
+      : null,
+  };
+}
+
+// 删除候选行并尽力清理其物理文件（行由调用方在事务内删除，文件在提交后删除）
+function unlinkAssetFile(storageName) {
+  fs.promises.unlink(path.join(UPLOAD_DIR, storageName)).catch(() => {});
+}
+
+// 过期候选清理：候选行降级为 expired 墓碑（保持修订号单调），物理文件删除。返回清理条数。
+// at 可注入（测试）；同时在各媒体接口上惰性调用。
+function sweepExpiredCandidates(at = Date.now()) {
+  const rows = get().prepare("SELECT id, video_id, storage_name FROM media_assets WHERE role = 'candidate' AND expires_at IS NOT NULL AND expires_at <= ?").all(at);
+  if (!rows.length) return 0;
+  get().transaction(() => {
+    for (const row of rows) {
+      get().prepare("UPDATE media_assets SET role = 'expired', expires_at = ? WHERE id = ?").run(at, row.id);
+    }
+  })();
+  for (const row of rows) unlinkAssetFile(row.storage_name);
+  return rows.length;
+}
+
+let mediaSweepTimer = null;
+function startMediaSweeper() {
+  if (mediaSweepTimer || MEDIA_SWEEP_INTERVAL_MS <= 0) return;
+  mediaSweepTimer = setInterval(() => {
+    try { sweepExpiredCandidates(); } catch (_) { /* 巡检失败不影响服务 */ }
+  }, MEDIA_SWEEP_INTERVAL_MS);
+  if (typeof mediaSweepTimer.unref === 'function') mediaSweepTimer.unref();
+}
+
+// 统一的媒体文件流式响应（Range 拖动）
+function streamMediaFile(req, res, asset) {
+  const filePath = path.join(UPLOAD_DIR, asset.storage_name);
+  if (!fs.existsSync(filePath)) {
+    throw new ApiError(404, 'file_missing', '媒体文件在服务器上缺失');
+  }
+  const stat = fs.statSync(filePath);
+  const range = req.headers.range;
+  if (range) {
+    const m = /bytes=(\d*)-(\d*)/.exec(range);
+    let start = m && m[1] ? parseInt(m[1], 10) : 0;
+    let end = m && m[2] ? parseInt(m[2], 10) : stat.size - 1;
+    if (Number.isNaN(start) || start >= stat.size) {
+      res.status(416).set({ 'Content-Range': `bytes */${stat.size}` }).end();
+      return;
+    }
+    if (Number.isNaN(end) || end >= stat.size) end = stat.size - 1;
+    res.status(206).set({
+      'Content-Range': `bytes ${start}-${end}/${stat.size}`,
+      'Accept-Ranges': 'bytes',
+      'Content-Length': end - start + 1,
+      'Content-Type': asset.mime_type || 'application/octet-stream',
+      'X-Media-Revision': String(asset.media_revision),
+    });
+    fs.createReadStream(filePath, { start, end }).pipe(res);
+  } else {
+    res.set({
+      'Accept-Ranges': 'bytes',
+      'Content-Length': stat.size,
+      'Content-Type': asset.mime_type || 'application/octet-stream',
+      'X-Media-Revision': String(asset.media_revision),
+    });
+    fs.createReadStream(filePath).pipe(res);
+  }
 }
 
 /* ---------------- 说话人名单 ---------------- */
@@ -169,6 +372,7 @@ function mapPublication(row) {
     translation_lang: row.translation_lang != null ? row.translation_lang : null,
     has_qc: row.qc_rules_snapshot != null,
     has_speakers: row.speaker_snapshot != null,
+    media_revision: row.media_revision == null ? 1 : row.media_revision,
     published_at: row.published_at,
   };
 }
@@ -669,6 +873,7 @@ router.get('/videos', (req, res) => {
 
 router.post('/videos', upload.single('video'), (req, res, next) => {
   let savedPath = null;
+  let committed = false;
   try {
     const title = (req.body.title || '').trim();
     const durationMs = Number(req.body.duration_ms);
@@ -679,17 +884,33 @@ router.post('/videos', upload.single('video'), (req, res, next) => {
     }
 
     savedPath = req.file.path;
-    const info = get()
-      .prepare(
-        `INSERT INTO videos (title, storage_name, original_name, mime_type, size_bytes, duration_ms, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`
-      )
-      .run(title, req.file.filename, req.file.originalname, req.file.mimetype, req.file.size, durationMs, now());
+    const ts = now();
+    let videoId;
+    // 视频记录与其首个媒体版次（修订号 1）同事务写入：任一失败都不会留下半成品
+    get().transaction(() => {
+      const info = get()
+        .prepare(
+          `INSERT INTO videos (title, storage_name, original_name, mime_type, size_bytes, duration_ms,
+             media_revision, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, 1, ?)`
+        )
+        .run(title, req.file.filename, req.file.originalname, req.file.mimetype,
+          req.file.size, durationMs, ts);
+      videoId = info.lastInsertRowid;
+      get()
+        .prepare(
+          `INSERT INTO media_assets (video_id, media_revision, role, storage_name, original_name,
+             mime_type, size_bytes, duration_ms, created_at, expires_at)
+           VALUES (?, 1, 'current', ?, ?, ?, ?, ?, ?, NULL)`
+        )
+        .run(videoId, req.file.filename, req.file.originalname, req.file.mimetype,
+          req.file.size, durationMs, ts);
+    })();
+    committed = true;
 
-    const video = loadVideo(info.lastInsertRowid);
-    res.status(201).json({ video, segments: [], publications: [] });
+    res.status(201).json({ video: loadVideo(videoId), segments: [], publications: [], media: mediaState(loadVideo(videoId)) });
   } catch (err) {
-    if (savedPath) fs.promises.unlink(savedPath).catch(() => {});
+    if (savedPath && !committed) fs.promises.unlink(savedPath).catch(() => {});
     next(err);
   }
 });
@@ -697,11 +918,13 @@ router.post('/videos', upload.single('video'), (req, res, next) => {
 router.get('/videos/:id(\\d+)', (req, res, next) => {
   try {
     const video = loadVideo(req.params.id);
+    sweepExpiredCandidates();
     const qcReport = loadLiveQc(video);
     const speakers = listSpeakers(video.id);
     const unassignedIds = unassignedSegmentIds(video.id);
     res.json({
       video,
+      media: mediaState(video),
       segments: listSegments(video.id),
       speakers,
       list_revision: video.speakers_revision,
@@ -729,52 +952,247 @@ router.get('/videos/:id(\\d+)', (req, res, next) => {
 router.delete('/videos/:id(\\d+)', (req, res, next) => {
   try {
     const video = loadVideo(req.params.id);
+    // 删除前收集该视频的全部媒体文件（当前、历史与待确认候选）
+    const mediaFiles = get()
+      .prepare('SELECT DISTINCT storage_name FROM media_assets WHERE video_id = ?')
+      .all(video.id)
+      .map((r) => r.storage_name);
+    // 兼容直接写库的历史异常库：videos.storage_name 若没有对应资产行也一并删除
+    if (!mediaFiles.includes(video.storage_name)) mediaFiles.push(video.storage_name);
     const tx = get().transaction(() => {
-      get().prepare('DELETE FROM segments WHERE video_id = ?').run(video.id);
-      get().prepare('DELETE FROM publications WHERE video_id = ?').run(video.id);
+      // media_assets/segments/publications 等均随外键 ON DELETE CASCADE 删除；
+      // 显式删除 videos 触发级联。
       get().prepare('DELETE FROM videos WHERE id = ?').run(video.id);
     });
     tx();
-    fs.promises.unlink(path.join(UPLOAD_DIR, video.storage_name)).catch(() => {});
+    for (const name of mediaFiles) unlinkAssetFile(name);
     res.status(204).end();
   } catch (err) {
     next(err);
   }
 });
 
-// 视频流（支持 Range 拖动播放）
+// 当前草稿媒体流（支持 Range 拖动播放）
 router.get('/videos/:id(\\d+)/media', (req, res, next) => {
   try {
     const video = loadVideo(req.params.id);
-    const filePath = path.join(UPLOAD_DIR, video.storage_name);
-    if (!fs.existsSync(filePath)) throw new ApiError(404, 'file_missing', '视频文件在服务器上缺失');
+    sweepExpiredCandidates();
+    const asset = loadCurrentMedia(video.id);
+    if (!asset) throw new ApiError(404, 'file_missing', '当前媒体在服务器上缺失');
+    streamMediaFile(req, res, asset);
+  } catch (err) {
+    next(err);
+  }
+});
 
-    const stat = fs.statSync(filePath);
-    const range = req.headers.range;
-    if (range) {
-      const m = /bytes=(\d*)-(\d*)/.exec(range);
-      let start = m && m[1] ? parseInt(m[1], 10) : 0;
-      let end = m && m[2] ? parseInt(m[2], 10) : stat.size - 1;
-      if (Number.isNaN(start) || start >= stat.size) {
-        res.status(416).set({ 'Content-Range': `bytes */${stat.size}` }).end();
-        return;
+// 指定媒体版次的流：?revision=N（任一现存版次；候选版次不允许播放）或
+// ?publication=V（已发布版本 V 发布时固定的媒体）。无参数等同当前草稿媒体。
+router.get('/videos/:id(\\d+)/media/history', (req, res, next) => {
+  try {
+    const video = loadVideo(req.params.id);
+    sweepExpiredCandidates();
+    let asset = null;
+    if (req.query.publication != null) {
+      const version = Number(req.query.publication);
+      if (!Number.isInteger(version) || version < 1) {
+        throw new ApiError(422, 'invalid_version', 'publication 必须为正整数版本号');
       }
-      if (Number.isNaN(end) || end >= stat.size) end = stat.size - 1;
-      res.status(206).set({
-        'Content-Range': `bytes ${start}-${end}/${stat.size}`,
-        'Accept-Ranges': 'bytes',
-        'Content-Length': end - start + 1,
-        'Content-Type': video.mime_type || 'application/octet-stream',
-      });
-      fs.createReadStream(filePath, { start, end }).pipe(res);
+      const pub = get()
+        .prepare('SELECT * FROM publications WHERE video_id = ? AND version = ?')
+        .get(video.id, version);
+      if (!pub) throw new ApiError(404, 'version_not_found', `已发布版本 v${version} 不存在`);
+      asset = loadMediaAsset(video.id, pub.media_revision);
+    } else if (req.query.revision != null) {
+      const revision = Number(req.query.revision);
+      if (!Number.isInteger(revision) || revision < 1) {
+        throw new ApiError(422, 'invalid_media_revision', 'revision 必须为正整数媒体修订号');
+      }
+      asset = loadMediaAsset(video.id, revision);
+      if (asset && (asset.role === 'candidate' || asset.role === 'expired')) {
+        // 候选尚未确认、或已取消/被替换/过期：不对外提供播放，避免暴露未生效/已清理的媒体
+        throw new ApiError(422, 'media_candidate_not_confirmed',
+          `媒体修订号 ${revision} 不是可播放的已生效版次（仍待确认、已取消或已过期清理）`);
+      }
     } else {
-      res.set({
-        'Accept-Ranges': 'bytes',
-        'Content-Length': stat.size,
-        'Content-Type': video.mime_type || 'application/octet-stream',
-      });
-      fs.createReadStream(filePath).pipe(res);
+      asset = loadCurrentMedia(video.id);
     }
+    if (!asset) throw new ApiError(404, 'media_not_found', '指定的媒体版次不存在（可能已随候选清理）');
+    streamMediaFile(req, res, asset);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// 上传校订版媒体（multipart 字段 media）：服务端解析时长，生成待确认候选并返回预览。
+// 无法解析时长或超出上传上限时拒绝并清理候选文件；上传新候选会替换旧候选（旧文件一并清理）。
+router.post('/videos/:id(\\d+)/media/candidate', mediaUploadSingle('media'), (req, res, next) => {
+  let savedPath = null;
+  let committed = false;
+  try {
+    const videoId = Number(req.params.id);
+    const video = loadVideo(videoId);
+    if (!req.file) throw new ApiError(422, 'missing_file', '请上传校订版媒体文件（multipart 字段名 media）');
+    savedPath = req.file.path;
+
+    // 服务端独立解析时长：无法解析（格式不支持 / 文件损坏）直接拒绝并清理已落盘文件
+    const parsedMs = probeDurationMs(req.file.path);
+    if (!Number.isInteger(parsedMs) || parsedMs <= 0) {
+      throw new ApiError(422, 'unparseable_media',
+        '服务端无法解析该媒体的时长：请使用浏览器可播放的 MP4（含 mvhd）或 WebM 文件；候选已拒绝并清理');
+    }
+
+    const ts = now();
+    const result = get().transaction(() => {
+      const locked = get().prepare('SELECT * FROM videos WHERE id = ?').get(videoId);
+      if (!locked) throw new ApiError(404, 'not_found', `视频 #${videoId} 不存在`);
+      // 替换旧候选：旧候选行降级为 expired 墓碑（物理文件在事务提交后删除）。
+      // 保留行是为了让该视频的媒体修订号严格单调、且确认被替换/取消/清理的旧修订号时
+      // 能明确识别为过期（409），而不会与后续候选撞号。
+      const oldCandidate = loadCandidateMedia(videoId);
+      if (oldCandidate) {
+        get().prepare("UPDATE media_assets SET role = 'expired', expires_at = ? WHERE id = ?")
+          .run(ts, oldCandidate.id);
+      }
+      const maxRev = get()
+        .prepare('SELECT COALESCE(MAX(media_revision), 1) AS m FROM media_assets WHERE video_id = ?')
+        .get(videoId).m;
+      const nextRev = Math.max(maxRev + 1, locked.media_revision + 1);
+      const expiresAt = ts + MEDIA_CANDIDATE_TTL_MS;
+      const info = get()
+        .prepare(
+          `INSERT INTO media_assets (video_id, media_revision, role, storage_name, original_name,
+             mime_type, size_bytes, duration_ms, created_at, expires_at)
+           VALUES (?, ?, 'candidate', ?, ?, ?, ?, ?, ?, ?)`
+        )
+        .run(videoId, nextRev, req.file.filename, req.file.originalname, req.file.mimetype,
+          req.file.size, parsedMs, ts, expiresAt);
+      return {
+        oldStorage: oldCandidate ? oldCandidate.storage_name : null,
+        row: get().prepare('SELECT * FROM media_assets WHERE id = ?').get(info.lastInsertRowid),
+        locked,
+      };
+    })();
+    committed = true;
+    if (result.oldStorage) unlinkAssetFile(result.oldStorage);
+
+    const check = evaluateCandidate(result.locked, result.row);
+    res.status(201).json({
+      ok: true,
+      candidate: mapMediaAsset(result.row),
+      current_media_revision: result.locked.media_revision,
+      recorded_duration_ms: result.locked.duration_ms,
+      check,
+      blocked: check.blocked,
+    });
+  } catch (err) {
+    // 超限由中间件转成 media_too_large（文件 multer 已清理）；其余失败若文件已落盘则在此清理
+    if (savedPath && !committed) fs.promises.unlink(savedPath).catch(() => {});
+    next(err);
+  }
+});
+
+// 确认替换：{revision: 预览候选时的媒体修订号}。
+// 过期（候选不存在 / 已被新候选替换 / 已超过 24h 清理）返回 409 与当前媒体状态，不发生切换；
+// 时长校验不通过 422；成功后草稿与后续发布改用新文件，历史发布继续播放各自固定的媒体。
+router.post('/videos/:id(\\d+)/media/confirm', (req, res, next) => {
+  try {
+    const videoId = Number(req.params.id);
+    const revision = Number(req.body && req.body.revision);
+    if (!Number.isInteger(revision) || revision < 1) {
+      throw new ApiError(422, 'missing_media_revision',
+        '请携带预览候选时的媒体修订号 revision（正整数）');
+    }
+    sweepExpiredCandidates();
+
+    const result = get().transaction(() => {
+      const locked = get().prepare('SELECT * FROM videos WHERE id = ?').get(videoId);
+      if (!locked) throw new ApiError(404, 'not_found', `视频 #${videoId} 不存在`);
+      const candidate = get()
+        .prepare('SELECT * FROM media_assets WHERE video_id = ? AND media_revision = ?')
+        .get(videoId, revision);
+
+      // 候选不存在：从未上传、已被更新的候选替换、已确认或已被清理 -> 过期，不切换
+      if (!candidate || candidate.role !== 'candidate') {
+        throw new ApiError(409, 'revision_conflict',
+          candidate
+            ? `媒体修订号 ${revision} 已不是待确认候选（可能已确认）；已返回当前媒体状态，未切换`
+            : `媒体修订号 ${revision} 的候选不存在或已过期（取消或上传后 24 小时未确认会被清理）；已返回当前媒体状态，未切换`,
+          { current_media: mediaState(locked) });
+      }
+
+      // 确认前重新校验（不信任预览结论）：±100ms 且覆盖草稿与全部已发布字幕末端
+      const check = evaluateCandidate(locked, candidate);
+      if (check.blocked) {
+        throw new ApiError(422, 'media_candidate_invalid',
+          `候选媒体不能确认：${check.issues.map((i) => i.message).join('；')}`,
+          { candidate: mapMediaAsset(candidate), check });
+      }
+
+      // 切换前确认文件真实存在：成功响应必须可播放（文件缺失则整次回滚，不暴露半成品）
+      if (!fs.existsSync(path.join(UPLOAD_DIR, candidate.storage_name))) {
+        // 物理文件丢失：候选降级为过期墓碑并按冲突处理（不切换当前媒体）
+        get().prepare("UPDATE media_assets SET role = 'expired', expires_at = ? WHERE id = ?")
+          .run(ts, candidate.id);
+        throw new ApiError(409, 'media_candidate_gone',
+          '候选媒体文件在服务器上已不可用，请重新上传校订版媒体；已返回当前媒体状态，未切换',
+          { current_media: mediaState(locked) });
+      }
+
+      const ts = now();
+      // 旧当前 -> 历史（文件保留：首次替换前的旧版以及每个历史版本都必须继续可播放）
+      get().prepare("UPDATE media_assets SET role = 'history' WHERE video_id = ? AND role = 'current'")
+        .run(videoId);
+      get().prepare("UPDATE media_assets SET role = 'current', expires_at = NULL WHERE id = ?")
+        .run(candidate.id);
+      // 视频记录指向新文件；duration_ms 同步为服务端解析值（差值已限制在 ±100ms，时间线仍合法）
+      get()
+        .prepare(
+          `UPDATE videos SET storage_name = ?, original_name = ?, mime_type = ?, size_bytes = ?,
+             duration_ms = ?, media_revision = ? WHERE id = ?`
+        )
+        .run(candidate.storage_name, candidate.original_name, candidate.mime_type,
+          candidate.size_bytes, candidate.duration_ms, candidate.media_revision, videoId);
+
+      // 防御性复算：切换后当前时间线必须仍然合法（时长差 ≤100ms 且候选覆盖字幕末端时成立）
+      const timeline = get()
+        .prepare('SELECT id, start_ms, end_ms FROM segments WHERE video_id = ?')
+        .all(videoId);
+      const revalidate = validateTimeline(timeline, candidate.duration_ms);
+      if (!revalidate.ok) {
+        throw new ApiError(422, 'invalid_timeline',
+          `替换后时间线不合法，未切换媒体：${revalidate.reason}`);
+      }
+      return { row: get().prepare('SELECT * FROM media_assets WHERE id = ?').get(candidate.id) };
+    })();
+
+    const video = loadVideo(videoId);
+    res.status(201).json({
+      ok: true,
+      media_revision: result.row.media_revision,
+      current: mapMediaAsset(result.row),
+      media: mediaState(video),
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// 取消候选：候选行降级为 expired 墓碑并删除物理文件；无候选时幂等返回 ok:false
+router.delete('/videos/:id(\\d+)/media/candidate', (req, res, next) => {
+  try {
+    const video = loadVideo(req.params.id);
+    const candidate = loadCandidateMedia(video.id);
+    if (!candidate) {
+      res.json({ ok: false, cancelled: false, media: mediaState(loadVideo(video.id)) });
+      return;
+    }
+    get().transaction(() => {
+      get().prepare("UPDATE media_assets SET role = 'expired', expires_at = ? WHERE id = ?")
+        .run(now(), candidate.id);
+    })();
+    unlinkAssetFile(candidate.storage_name);
+    res.json({ ok: true, cancelled: true, media_revision: candidate.media_revision,
+      media: mediaState(loadVideo(video.id)) });
   } catch (err) {
     next(err);
   }
@@ -1845,11 +2263,13 @@ router.post('/videos/:id(\\d+)/publish', (req, res, next) => {
       const info = get()
         .prepare(
           `INSERT INTO publications (video_id, version, snapshot, translation_snapshot, translation_lang,
-             qc_rules_snapshot, qc_report_snapshot, speaker_snapshot, segment_count, published_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+             qc_rules_snapshot, qc_report_snapshot, speaker_snapshot, media_revision,
+             segment_count, published_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
         )
         .run(video.id, version, snapshot, translationSnapshot, locked.translation_lang,
-          qcRulesSnapshot, qcReportSnapshot, speakerSnapshot, segments.length, now());
+          qcRulesSnapshot, qcReportSnapshot, speakerSnapshot, locked.media_revision,
+          segments.length, now());
       return get().prepare('SELECT * FROM publications WHERE id = ?').get(info.lastInsertRowid);
     })();
     res.status(201).json({ publication: mapPublication(pub) });
@@ -2724,3 +3144,5 @@ router.post('/videos/:id(\\d+)/segments/shift/confirm', (req, res, next) => {
 });
 
 module.exports = router;
+module.exports.startMediaSweeper = startMediaSweeper;
+module.exports.sweepExpiredCandidates = sweepExpiredCandidates;

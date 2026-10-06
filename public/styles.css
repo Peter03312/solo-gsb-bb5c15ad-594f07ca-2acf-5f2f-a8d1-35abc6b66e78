@@ -259,3 +259,7 @@ tr.import-conflict td { background: rgba(240,169,59,.12); }
 /* 说话人名单 */
 .speaker-select { padding: 3px 6px; font-size: 12.5px; max-width: 130px; }
 .sp-name { font-weight: 600; }
+
+/* 媒体版次 */
+.media-history { margin: 8px 0 0; padding-left: 18px; font-size: 12.5px; line-height: 1.7; }
+.media-history a { white-space: nowrap; }

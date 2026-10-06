@@ -189,24 +189,24 @@ async function tests() {
     init(dbPath);
     const info = getMigrationInfo();
     const conn = get();
-    eq('返回当前版本 v4', info.currentVersion, 4);
+    eq('返回当前版本 v5', info.currentVersion, 5);
     const regs = registry(conn);
-    eq('登记 4 个版本', regs.map((r) => r.version), [1, 2, 3, 4]);
+    eq('登记 5 个版本', regs.map((r) => r.version), [1, 2, 3, 4, 5]);
     check('空库全部为执行升级(up)', regs.every((r) => r.applied_kind === 'up'), JSON.stringify(regs));
     const tables = tableNames(conn);
-    for (const t of ['videos', 'segments', 'publications', 'translations', 'qc_rules', 'qc_waivers', 'speakers']) {
+    for (const t of ['videos', 'segments', 'publications', 'translations', 'qc_rules', 'qc_waivers', 'speakers', 'media_assets']) {
       check(`表存在: ${t}`, tables.has(t));
     }
     check('segments.speaker_id 存在', colNames(conn, 'segments').includes('speaker_id'));
-    check('videos 译文/名单列存在',
-      ['translation_lang', 'speakers_revision'].every((c) => colNames(conn, 'videos').includes(c)));
-    check('publications 五列快照存在',
-      ['translation_snapshot', 'translation_lang', 'qc_rules_snapshot', 'qc_report_snapshot', 'speaker_snapshot']
+    check('videos 译文/名单/媒体版次列存在',
+      ['translation_lang', 'speakers_revision', 'media_revision'].every((c) => colNames(conn, 'videos').includes(c)));
+    check('publications 五列快照与媒体修订号存在',
+      ['translation_snapshot', 'translation_lang', 'qc_rules_snapshot', 'qc_report_snapshot', 'speaker_snapshot', 'media_revision']
         .every((c) => colNames(conn, 'publications').includes(c)));
     const indexes = conn.prepare("SELECT name FROM sqlite_master WHERE type='index' AND name NOT LIKE 'sqlite_%'").all().map((r) => r.name).sort();
     eq('全部业务索引就位', indexes, [
-      'idx_publications_video', 'idx_qc_waivers_video', 'idx_segments_speaker',
-      'idx_segments_video', 'idx_speakers_video', 'idx_translations_video',
+      'idx_media_assets_video', 'idx_publications_video', 'idx_qc_waivers_video',
+      'idx_segments_speaker', 'idx_segments_video', 'idx_speakers_video', 'idx_translations_video',
     ]);
     // 外键关系仍在（segments -> videos 级联）
     conn.prepare('INSERT INTO videos (id,title,storage_name,original_name,size_bytes,duration_ms,created_at) VALUES (?,?,?,?,?,?,?)')
@@ -215,6 +215,7 @@ async function tests() {
       .run(99, 0, 500, 't', 1);
     conn.prepare('DELETE FROM videos WHERE id = 99').run();
     eq('外键级联仍生效：删视频后片段级联消失', conn.prepare('SELECT COUNT(*) n FROM segments').get().n, 0);
+    eq('外键级联：删视频后媒体资产级联消失', conn.prepare('SELECT COUNT(*) n FROM media_assets').get().n, 0);
     check('升级完成 isReady', isReady() === true);
     await close();
 
@@ -222,8 +223,8 @@ async function tests() {
     init(dbPath);
     const again = getMigrationInfo();
     eq('再次启动无版本执行', again.applied, []);
-    eq('版本仍为 v4', again.currentVersion, 4);
-    eq('登记仍恰为 4 行', registry(get()).length, 4);
+    eq('版本仍为 v5', again.currentVersion, 5);
+    eq('登记仍恰为 5 行', registry(get()).length, 5);
     await close();
   }
 
@@ -237,7 +238,7 @@ async function tests() {
     const conn = openRaw(dbPath);
     const regs = registry(conn);
     eq('v1 旧库：v1 登记为 baseline', regs.find((r) => r.version === 1).applied_kind, 'baseline');
-    eq('v1 旧库：v2~v4 登记为 up', [2, 3, 4].map((v) => regs.find((r) => r.version === v).applied_kind), ['up', 'up', 'up']);
+    eq('v1 旧库：v2~v5 登记为 up', [2, 3, 4, 5].map((v) => regs.find((r) => r.version === v).applied_kind), ['up', 'up', 'up', 'up']);
     check('补 translations/qc/speakers 等全部结构',
       ['translations', 'qc_rules', 'qc_waivers', 'speakers'].every((t) => tableNames(conn).has(t))
       && colNames(conn, 'segments').includes('speaker_id'));
@@ -252,7 +253,7 @@ async function tests() {
     const conn = openRaw(dbPath);
     const regs = registry(conn);
     eq('v2 旧库：v1~v2 为 baseline', [1, 2].map((v) => regs.find((r) => r.version === v).applied_kind), ['baseline', 'baseline']);
-    eq('v2 旧库：v3~v4 为 up', [3, 4].map((v) => regs.find((r) => r.version === v).applied_kind), ['up', 'up']);
+    eq('v2 旧库：v3~v5 为 up', [3, 4, 5].map((v) => regs.find((r) => r.version === v).applied_kind), ['up', 'up', 'up']);
     conn.close();
   }
   {
@@ -265,7 +266,7 @@ async function tests() {
     const regs = registry(conn);
     eq('v3 旧库：v1~v3 为 baseline', [1, 2, 3].map((v) => regs.find((r) => r.version === v).applied_kind),
       ['baseline', 'baseline', 'baseline']);
-    eq('v3 旧库：v4 为 up', regs.find((r) => r.version === 4).applied_kind, 'up');
+    eq('v3 旧库：v4~v5 为 up', [4, 5].map((v) => regs.find((r) => r.version === v).applied_kind), ['up', 'up']);
     conn.close();
   }
   {
@@ -275,8 +276,8 @@ async function tests() {
     check('全结构旧库识别为旧库', info.legacy === true);
     const conn = openRaw(dbPath);
     const regs = registry(conn);
-    eq('全结构旧库：4 个版本全部 baseline 登记（不执行结构变更）',
-      regs.map((r) => r.applied_kind), ['baseline', 'baseline', 'baseline', 'baseline']);
+    eq('全结构旧库：v1~v4 baseline、v5 up',
+      regs.map((r) => r.applied_kind), ['baseline', 'baseline', 'baseline', 'baseline', 'up']);
     conn.close();
     // 再次启动视为普通已登记库
     const info2 = migrate(openRaw(dbPath), migrations);
@@ -320,6 +321,14 @@ async function tests() {
     const p = conn.prepare('SELECT * FROM publications WHERE id = 1').get();
     check('发布快照保留', p && p.version === 1 && /旧字幕/.test(p.snapshot) && p.segment_count === 1,
       JSON.stringify(p));
+    // v5：媒体资产回填为修订号 1，且视频与发布记录都固定在修订号 1
+    const vRow = conn.prepare('SELECT media_revision FROM videos WHERE id = 1').get();
+    eq('旧视频 media_revision 回填为 1', vRow.media_revision, 1);
+    const ma = conn.prepare('SELECT * FROM media_assets WHERE video_id = 1 AND media_revision = 1').get();
+    check('旧视频回填首个媒体版次（current，指向原文件）',
+      ma && ma.role === 'current' && ma.storage_name === 'stored.bin' && ma.original_name === 'old.mp4'
+      && ma.size_bytes === 1234 && ma.duration_ms === 60000, JSON.stringify(ma));
+    eq('旧发布 media_revision 回填为 1', conn.prepare('SELECT media_revision FROM publications WHERE id = 1').get().media_revision, 1);
     conn.close();
   }
 
@@ -335,11 +344,11 @@ async function tests() {
     const others = results.filter((r) => r !== first);
     check('仅 1 个进程执行升级', !!first && others.every((r) => r.out && r.out.applied.length === 0),
       `applied 长度分布: ${results.map((r) => r.out && r.out.applied.length).join(',')}`);
-    eq('执行升级的进程恰好顺序跑 v1~v4', first.out.applied.map((a) => a.version), [1, 2, 3, 4]);
+    eq('执行升级的进程恰好顺序跑 v1~v5', first.out.applied.map((a) => a.version), [1, 2, 3, 4, 5]);
     const conn = openRaw(dbPath);
     const regs = registry(conn);
-    eq('登记恰为 4 行（无重复）', regs.map((r) => [r.version, r.applied_kind]),
-      [[1, 'up'], [2, 'up'], [3, 'up'], [4, 'up']]);
+    eq('登记恰为 5 行（无重复）', regs.map((r) => [r.version, r.applied_kind]),
+      [[1, 'up'], [2, 'up'], [3, 'up'], [4, 'up'], [5, 'up']]);
     conn.close();
   }
   {
@@ -350,9 +359,9 @@ async function tests() {
     check('3 个进程均成功', results.every((r) => r.code === 0), JSON.stringify(results.map((r) => r.code)));
     const conn = openRaw(dbPath);
     const regs = registry(conn);
-    eq('旧库并发：v1~v3 baseline、v4 up，各一次',
+    eq('旧库并发：v1~v3 baseline、v4~v5 up，各一次',
       regs.map((r) => [r.version, r.applied_kind]),
-      [[1, 'baseline'], [2, 'baseline'], [3, 'baseline'], [4, 'up']]);
+      [[1, 'baseline'], [2, 'baseline'], [3, 'baseline'], [4, 'up'], [5, 'up']]);
     check('仅一个进程实际做事',
       results.filter((r) => r.out && r.out.applied.length > 0).length === 1);
     conn.close();
@@ -373,30 +382,30 @@ async function tests() {
     check('v1 结构保留', tableNames(conn).has('segments') && tableNames(conn).has('publications'));
     conn.close();
 
-    // 不修复不能继续？—— 修复后（正常清单）重试可成功，结构到 v4
+    // 不修复不能继续？—— 修复后（正常清单）重试可成功，结构到 v5
     const r2 = await runWorker(dbPath, []);
     eq('修复后重试退出 0', r2.code, 0);
     const conn2 = openRaw(dbPath);
-    eq('重试后登记补齐到 v4', registry(conn2).map((x) => x.version), [1, 2, 3, 4]);
+    eq('重试后登记补齐到 v5', registry(conn2).map((x) => x.version), [1, 2, 3, 4, 5]);
     check('translations 已补建', tableNames(conn2).has('translations'));
+    check('media_assets 已补建', tableNames(conn2).has('media_assets'));
     conn2.close();
   }
   {
-    // 在 v4 注入失败：v3 已提交，v4 的表/列/登记全部回滚
-    const dbPath = newDbPath('rollback-v4');
-    const r1 = await runWorker(dbPath, ['--fail-at', '4']);
-    eq('v4 失败退出码非零', r1.code, 2);
+    // 在 v5 注入失败：v4 已提交，v5 的表/列/登记全部回滚
+    const dbPath = newDbPath('rollback-v5');
+    const r1 = await runWorker(dbPath, ['--fail-at', '5']);
+    eq('v5 失败退出码非零', r1.code, 2);
     const conn = openRaw(dbPath);
-    eq('登记停在 v3', registry(conn).map((x) => x.version), [1, 2, 3]);
-    const tables = tableNames(conn);
-    check('speakers 表随 v4 事务回滚', !tables.has('speakers'));
-    check('segments.speaker_id 列回滚', !colNames(conn, 'segments').includes('speaker_id'));
-    check('publications.speaker_snapshot 列回滚', !colNames(conn, 'publications').includes('speaker_snapshot'));
+    eq('登记停在 v4', registry(conn).map((x) => x.version), [1, 2, 3, 4]);
+    check('media_assets 表随 v5 事务回滚', !tableNames(conn).has('media_assets'));
+    check('videos.media_revision 列回滚', !colNames(conn, 'videos').includes('media_revision'));
+    check('publications.media_revision 列回滚', !colNames(conn, 'publications').includes('media_revision'));
     conn.close();
     const r2 = await runWorker(dbPath, []);
     eq('重试成功', r2.code, 0);
     const conn2 = openRaw(dbPath);
-    eq('登记到 v4', registry(conn2).length, 4);
+    eq('登记到 v5', registry(conn2).length, 5);
     conn2.close();
   }
 

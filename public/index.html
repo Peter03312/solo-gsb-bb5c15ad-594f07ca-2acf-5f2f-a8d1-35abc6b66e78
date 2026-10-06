@@ -338,6 +338,38 @@
     </div>
   </div>
 
+  <!-- 校订版媒体替换弹窗 -->
+  <div id="mediaModal" class="modal hidden">
+    <div class="modal-card">
+      <h3>替换校订版媒体</h3>
+      <p class="meta">上传服务端可解析时长的 <b>MP4 / WebM</b> 校订版：先预览文件名、大小与服务端解析时长，
+        确认须携带预览时的媒体修订号。<b>时长须与当前记录相差不超过 100ms，且不短于草稿及任一已发布字幕的末端</b>。
+        成功后仅草稿与后续发布改用新文件；历史发布版本继续播放各自发布时的媒体；字幕、译文、审校、质检、说话人及其修订号均不变。
+        取消或上传后 24 小时未确认的候选会自动清理。</p>
+      <div class="form-row">
+        <label>校订版媒体文件
+          <input type="file" id="mediaFile" accept="video/*" />
+        </label>
+        <button type="button" class="btn primary" id="mediaUploadBtn">上传并预览</button>
+      </div>
+      <p id="mediaUploadMsg" class="meta"></p>
+      <div id="mediaCurrentBox" class="meta"></div>
+      <div id="mediaCandidateBox" class="hidden">
+        <h4 style="margin:10px 0 4px">待确认候选</h4>
+        <div id="mediaCandidateInfo" class="meta"></div>
+        <div id="mediaIssueBox" class="conflict-box hidden">
+          <b>⚠️ 该候选当前不能确认</b>
+          <ul id="mediaIssueList"></ul>
+        </div>
+      </div>
+      <p id="mediaError" class="error"></p>
+      <div class="modal-actions">
+        <button type="button" class="btn ghost" id="mediaCancelCandidateBtn" disabled>取消候选并清理</button>
+        <button type="button" class="btn primary" id="mediaConfirmBtn" disabled>确认替换（使用新媒体）</button>
+      </div>
+    </div>
+  </div>
+
   <script src="/app.js"></script>
 </body>
 </html>

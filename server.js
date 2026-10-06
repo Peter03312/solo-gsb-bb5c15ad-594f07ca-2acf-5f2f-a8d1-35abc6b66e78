@@ -5,6 +5,7 @@ const path = require('path');
 const { init, isReady } = require('./src/db');
 const { ApiError } = require('./src/validation');
 const apiRouter = require('./src/routes');
+const { startMediaSweeper } = require('./src/routes');
 
 const PORT = Number(process.env.PORT || 8080);
 const HOST = process.env.HOST || '0.0.0.0';
@@ -47,10 +48,12 @@ app.use((err, req, res, next) => {
   if (err && err.code === 'LIMIT_FILE_SIZE') {
     res.status(422).json({ error: { code: 'file_too_large', message: '视频文件超过上传大小上限（MAX_UPLOAD_MB）' } });
     return;
-  }
-  console.error('[unhandled]', err);
+  }  console.error('[unhandled]', err);
   res.status(500).json({ error: { code: 'internal', message: '服务器内部错误' } });
 });
+
+// 校订版媒体候选的 24 小时定时清理（过期候选在各媒体接口上另有惰性清理）
+startMediaSweeper();
 
 app.listen(PORT, HOST, () => {
   console.log(`Subtitle Desk 已启动: http://localhost:${PORT}  (数据文件: ${DB_PATH})`);

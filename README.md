@@ -74,6 +74,15 @@
   - **视频存在说话人时，未归属片段阻止发布**，失败返回逐段清单（原因 `speaker_unassigned`，不产生版本）；没有说话人的视频门禁与旧版本完全一致；
   - 成功发布**固定当时的说话人名称与逐段归属**（说话人快照）；之后改名、增删说话人或修改草稿归属都**不影响历史版本**（草稿立即显示新名）；可查询任一发布版本固定的说话人快照；
   - **原有 SRT 导出（原文/译文、草稿/历史版本）与旧发布版本语义完全不变**：SRT 不含说话人信息；无说话人名单时发布的旧版本没有说话人快照。
+- **校订版媒体替换（预览 → 确认；媒体版次 `media_revision`）**：视频配好字幕后，可在工作台上传**校订版媒体**：
+  - 上传后服务端**独立解析媒体时长**（纯 Node 解析 MP4 `mvhd` 与 WebM/Matroska EBML，无需 ffprobe），工作台预览其**文件名、大小与服务端解析时长**；无法解析（非 MP4/WebM 或文件损坏）或超过上传上限（`MAX_UPLOAD_MB`）时**拒绝并清理候选文件**（不落候选）；
+  - 仅当解析时长与视频记录**相差不超过 100ms**、且**不早于草稿及任一已发布字幕的末端**（所有片段终点都落在新文件内）时才允许确认；其余情况候选保留为待确认并逐条给出问题（`duration_mismatch` / `media_too_short`），确认时被 `422` 拒绝；
+  - 确认必须携带**预览时的媒体修订号** `revision`：候选被更新的上传替换、被取消、超过 **24 小时**未确认或已确认后，旧修订号一律返回 `409 revision_conflict` 与**当前媒体状态**，**不发生切换**；
+  - 候选可随时**取消**；上传后 24 小时未确认的候选由定时巡检与接口惰性清理共同清除（候选行降级为墓碑、物理文件删除）；
+  - 成功后**草稿播放改用新文件**，视频记录时长同步为服务端解析值（时间线在事务内复算，差值受 ±100ms 约束，仍合法）；
+  - **所有现存发布版本仍播放各自发布时固定的媒体**：首次替换前的旧文件也永久保留；之后的发布固定当前新媒体；可按 `?publication=<版本号>` 播放任一历史版本的媒体；
+  - **字幕、译文、审校、质检、说话人名单/归属及其修订号都不因换媒体而变化**；草稿播放入口、原文/译文 SRT 与历史快照含义不变；
+  - 媒体记录与文件切换在同一事务内完成并在提交前确认文件存在：**成功响应一定可播放，任何失败都不暴露半成品**；删除视频时清理该视频**全部关联媒体文件**（当前、历史与待确认候选）。
 
 ## 一键启动（Docker Compose，推荐）
 
@@ -114,14 +123,14 @@ npm start
 
 同样访问 http://localhost:8080 。数据默认写入项目下 `./data/`。
 
-运行端到端测试（覆盖校验、冲突、审校撤销、发布门禁、不可变版本、SRT 导入/冲突/整批原子写入、历史版本区间恢复、多片段整体平移的越界/重叠拒绝/译文失效/门禁联动、译文轨道双修订号/失效规则/双轨发布门禁与快照/译文 SRT 导出，质检阈值配置/码点计数/逐段报告/单项放行/失效锁存/发布阻断与版本快照/并发拒绝，片段拆分的切点校验/双修订号/双段译文/复制禁止/放行失效/历史版本不可变，以及说话人名单 trim/去重/名单修订号/删除引用保护、片段归属修订号/转待审/译文不失效、未归属阻止发布与名称-归属快照不可变、拆分沿用与导入/恢复新片段未归属等 571 个断言）：
+运行端到端测试（覆盖校验、冲突、审校撤销、发布门禁、不可变版本、SRT 导入/冲突/整批原子写入、历史版本区间恢复、多片段整体平移的越界/重叠拒绝/译文失效/门禁联动、译文轨道双修订号/失效规则/双轨发布门禁与快照/译文 SRT 导出，质检阈值配置/码点计数/逐段报告/单项放行/失效锁存/发布阻断与版本快照/并发拒绝，片段拆分的切点校验/双修订号/双段译文/复制禁止/放行失效/历史版本不可变，说话人名单 trim/去重/名单修订号/删除引用保护、片段归属修订号/转待审/译文不失效、未归属阻止发布与名称-归属快照不可变、拆分沿用与导入/恢复新片段未归属，以及校订版媒体的服务端时长解析/±100ms 与字幕末端校验/预览-确认修订号/过期 409/取消与 24 小时清理/草稿换文件而历史发布媒体固定/多版次链/超限与不可解析拒绝/删视频清理全部媒体文件等 799 个断言）：
 
 ```bash
 npm test
 ```
 
-测试分两部分：`test/migrate.test.js`（版本化升级流程，70 个断言）与
-`test/api.test.js`（业务与 HTTP API，571 个断言），`npm test` 会依次运行两者。
+测试分两部分：`test/migrate.test.js`（版本化升级流程，76 个断言）与
+`test/api.test.js`（业务与 HTTP API，723 个断言），`npm test` 会依次运行两者。
 
 ## 数据库升级（版本化迁移）
 
@@ -152,6 +161,10 @@ npm test
 `schema_migrations` 表记录 `version` / `name` / `applied_kind`（`up` 实际执行、
 `baseline` 旧库识别登记）/ `applied_at`。
 
+> 本轮新增 **v5（`media_revision`）**：建立 `media_assets` 表（每个视频的当前/历史/候选/过期媒体版次），
+> 并为 `videos`、`publications` 增加 `media_revision` 列；旧库升级时为每个已有视频回填修订号 1 的
+> 当前媒体资产，并把升级前的发布记录统一固定到修订号 1。升级只补结构与登记，既有媒体文件与播放地址不变。
+
 **新增结构变更时**：只在 `src/migrations/index.js` 的数组末尾追加新版本
 （版本号连续递增，`up` 保持幂等，并提供判定该版本最终结构的 `predicate`），
 不得改写或删除已发布的版本。
@@ -164,8 +177,10 @@ npm test
 | `HOST` | `0.0.0.0` | 监听地址；仅本机使用可设 `127.0.0.1` |
 | `DB_PATH` | `./data/app.db` | SQLite 数据库文件路径，首次启动自动建表；旧库首次启动按版本化升级补齐（见上节） |
 | `UPLOAD_DIR` | `./data/videos` | 上传视频存储目录，自动创建 |
-| `MAX_UPLOAD_MB` | `2048` | 单个视频上传大小上限（MB） |
+| `MAX_UPLOAD_MB` | `2048` | 媒体上传大小上限（MB），首次上传与校订版媒体候选共用 |
 | `MAX_SRT_KB` | `10240` | 单个 SRT 导入文件大小上限（KB，默认 10 MB，仅内存解析） |
+| `MEDIA_CANDIDATE_TTL_MS` | `86400000` | 校订版媒体候选保留时长（毫秒，默认 24 小时），超时未确认自动清理 |
+| `MEDIA_SWEEP_INTERVAL_MS` | `3600000` | 候选过期定时巡检间隔（毫秒，默认 1 小时；另在媒体接口上惰性清理） |
 
 Compose 中改宿主机端口示例（宿主 9000 → 容器 8080）：
 
@@ -207,6 +222,10 @@ Compose 中改宿主机端口示例（宿主 9000 → 容器 8080）：
 11. 需要区分说话人时，在右侧「说话人名单」卡片「新增说话人」（如主持人、嘉宾A），再在片段表「说话人」列下拉里
     逐段归属；归属成功会让该段原文转**待审**（文字、时间与译文不变，需重新审校）。被片段引用的说话人不能删除，
     须先改这些片段的归属。存在说话人后，未归属片段会阻止发布；发布固定当时名称与逐段归属，之后改名或改草稿不影响历史版本。
+12. 需要更换校订版媒体时（如修正了画面/音轨但时长几乎不变），点视频卡片右上「🎞 替换校订版媒体…」：
+    选择 MP4/WebM 文件后「上传并预览」，核对文件名、大小与**服务端解析时长**；仅当与记录相差 ≤100ms
+    且不短于草稿及任一已发布字幕末端时「确认替换」可点。确认后草稿立即播放新文件；右侧「媒体版次」卡片与
+    每个历史发布条目提供「▶ 播放该版本媒体」入口，历史发布永远播放其发布时固定的旧文件；候选 24 小时未确认会自动清理。
 
 ## HTTP API 摘要
 
@@ -216,14 +235,18 @@ Compose 中改宿主机端口示例（宿主 9000 → 容器 8080）：
 还须对两段分别提交当前译文修订号（正整数）或显式 `null` 标识缺失：`first_translation_revision`/`second_translation_revision`**）。
 质检规则修改携带所见规则修订号 `rules_revision`（首次配置传 `0`）；质检放行携带 `segment_revision`，
 译文放行还需译文 `revision`；**说话人名单增删改携带所见名单修订号 `list_revision`（首次传 `0`），片段归属修改携带
-所见片段修订号 `revision`**；过期一律 `409 revision_conflict` 并返回当前状态。
+所见片段修订号 `revision`**；**校订版媒体替换确认携带预览候选时的媒体修订号 `revision`（媒体版次独立于字幕/名单等修订号）**；过期一律 `409 revision_conflict` 并返回当前状态。
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | `POST` | `/api/videos` | multipart 上传：`title`、`duration_ms`、`video` |
 | `GET` | `/api/videos` / `/api/videos/:id` | 列表 / 详情（含片段与发布版本） |
 | `DELETE` | `/api/videos/:id` | 删除视频及其全部数据 |
-| `GET` | `/api/videos/:id/media` | 视频流（支持 `Range`） |
+| `GET` | `/api/videos/:id/media` | 视频流（支持 `Range`，响应头 `X-Media-Revision` 为当前媒体版次） |
+| `GET` | `/api/videos/:id/media/history?publication=<v>` | 播放已发布版本 v 发布时固定的媒体（`?revision=<n>` 按媒体版次播放；候选/已取消版次拒绝） |
+| `POST` | `/api/videos/:id/media/candidate` | multipart 上传校订版媒体（字段 `media`）：服务端解析时长并生成待确认候选，预览文件名/大小/时长与校验结果 |
+| `POST` | `/api/videos/:id/media/confirm` | 确认替换 `{revision}`（预览时的媒体修订号）；过期 `409` 返回当前媒体状态，校验不过 `422` |
+| `DELETE` | `/api/videos/:id/media/candidate` | 取消待确认候选并清理其文件（无候选时幂等） |
 | `POST` | `/api/videos/:id/segments` | 新增片段 `{start_ms,end_ms,text}` |
 | `PUT` | `/api/videos/:id/segments/:sid` | 修改 `{start_ms,end_ms,text,revision}` |
 | `POST` | `/api/videos/:id/segments/:sid/split` | 拆分片段 `{cut_ms,left_text,right_text,revision[,left_translation,right_translation,translation_revision]}`，原子拆为左右两段 |
@@ -260,6 +283,89 @@ Compose 中改宿主机端口示例（宿主 9000 → 容器 8080）：
 
 错误响应统一为 `{ "error": { "code", "message", "current?" } }`：
 `422` 为非法修改（含原因），`409` 为修订冲突（`current` 为最新片段）。
+
+### 校订版媒体替换调用示例（上传预览 → 确认）
+
+为已配字幕的视频上传校订版媒体。服务端**自行解析时长**（MP4/WebM，无需浏览器或 ffprobe），
+仅当解析时长与记录相差 ≤100ms 且不短于草稿及任一已发布字幕末端时才能确认。确认须携带
+**预览时的媒体修订号**；候选可取消，上传后 24 小时未确认自动清理。
+
+第一步——上传候选并预览（multipart 字段 `media`，不落草稿、不影响任何播放）：
+
+```bash
+V=12
+curl -s -X POST http://localhost:8080/api/videos/$V/media/candidate \
+  -F "media=@revised.mp4;type=video/mp4"
+```
+
+成功返回 `201`（即使 `blocked=true` 也返回，供工作台展示问题；此时确认会被拒）：
+
+```json
+{
+  "ok": true,
+  "current_media_revision": 1,
+  "recorded_duration_ms": 10000,
+  "candidate": {
+    "media_revision": 2,
+    "role": "candidate",
+    "original_name": "revised.mp4",
+    "mime_type": "video/mp4",
+    "size_bytes": 840,
+    "duration_ms": 10050,
+    "expires_at": 1791398400000
+  },
+  "check": {
+    "diff_ms": 50,
+    "duration_ok": true,
+    "required_end_ms": 3000,
+    "covers": true,
+    "blocked": false,
+    "issues": []
+  },
+  "blocked": false
+}
+```
+
+第二步——确认（携带预览候选的媒体修订号 `revision`）：
+
+```bash
+curl -s -X POST http://localhost:8080/api/videos/$V/media/confirm \
+  -H 'Content-Type: application/json' -d '{"revision":2}'
+```
+
+返回 `201`：草稿改用新文件、视频记录时长更新为服务端解析值，响应回传完整 `media` 状态
+（`current` / `history`（含 `used_by_versions`）/ `candidate`）。之后：
+
+```bash
+# 草稿（工作台播放器）始终是当前最新媒体，响应头 X-Media-Revision 标识版次
+curl -s -D - -o /dev/null http://localhost:8080/api/videos/$V/media | grep -i x-media-revision
+
+# 历史发布版本永远播放各自发布时固定的媒体（首次替换前的旧文件也保留）
+curl -s -o v1.mp4 "http://localhost:8080/api/videos/$V/media/history?publication=1"
+# 或直接按媒体版次播放（候选/已取消/过期版次返回 422）
+curl -s -o rev1.mp4 "http://localhost:8080/api/videos/$V/media/history?revision=1"
+
+# 取消候选（24 小时未确认也会被定时与惰性清理自动取消）
+curl -s -X DELETE http://localhost:8080/api/videos/$V/media/candidate
+```
+
+视频详情 `GET /api/videos/:id` 新增 `media` 字段：`media_revision`（当前版次）、`current`、
+`history[]`（每项含被哪些发布 `used_by_versions` 使用）与 `candidate`（含 `check`）；
+发布列表/发布响应中的每个版本带 `media_revision`，即该版本固定的媒体版次。
+字幕、译文、审校、质检、说话人及其修订号均不随换媒体变化。
+
+失败约定：
+
+| 状态 / code | 含义 |
+| --- | --- |
+| `422 unparseable_media` | 服务端无法解析媒体时长（非 MP4/WebM 或文件损坏）；候选文件已拒绝并清理 |
+| `422 media_too_large` | 超过上传上限 `MAX_UPLOAD_MB`；候选已拒绝并清理 |
+| `422 media_candidate_invalid` | 确认时复校不通过（`error.check.issues[]`：`duration_mismatch` 差超 100ms / `media_too_short` 早于字幕末端），未切换 |
+| `422 missing_media_revision` | 确认未携带正整数 `revision` |
+| `422 media_candidate_not_confirmed` | 请求播放的版次仍是候选、已取消或已过期清理 |
+| `409 revision_conflict` | 候选修订号已过期（被新候选替换/取消/24h 清理/已确认）；`error.current_media` 为当前媒体状态，不切换 |
+| `409 media_candidate_gone` | 候选物理文件已不可用；候选置为过期、不切换，需重新上传 |
+| `404 media_not_found` / `404 version_not_found` | 指定的媒体版次/发布版本不存在 |
 
 ### SRT 导入调用示例（两步：预览 → 确认）
 
@@ -850,8 +956,8 @@ curl -s http://localhost:8080/api/videos/$V/publications/2/speakers
 
 ## 数据布局```
 data/
-├── app.db            # SQLite：videos / segments / speakers / translations / qc_rules / qc_waivers / publications
-└── videos/           # 上传的原始视频文件（随机化文件名）
+├── app.db            # SQLite：videos / segments / speakers / translations / qc_rules / qc_waivers / publications / media_assets
+└── videos/           # 上传的媒体文件（随机化文件名；当前、历史与待确认候选各自独立留存）
 ```
 
 > 说明：本应用面向可信的本机/小团队内网环境，未内置账号鉴权；如需公网暴露，请自行置于

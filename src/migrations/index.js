@@ -203,6 +203,56 @@ const migrations = [
       addColumnIfMissing(db, 'publications', 'speaker_snapshot', 'TEXT');
     },
   },
+  {
+    version: 5,
+    name: 'media_revision',
+    description: '媒体版次：media_assets 表（候选/历史文件）、视频与发布固定媒体修订号',
+    predicate: (db) => {
+      const tables = new Set(
+        db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all().map((r) => r.name),
+      );
+      if (!tables.has('media_assets')) return false;
+      const videoCols = db.prepare('PRAGMA table_info(videos)').all().map((c) => c.name);
+      const pubCols = db.prepare('PRAGMA table_info(publications)').all().map((c) => c.name);
+      return videoCols.includes('media_revision') && pubCols.includes('media_revision');
+    },
+    up: (db) => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS media_assets (
+          id            INTEGER PRIMARY KEY AUTOINCREMENT,
+          video_id      INTEGER NOT NULL REFERENCES videos(id) ON DELETE CASCADE,
+          media_revision INTEGER NOT NULL,
+          role          TEXT NOT NULL CHECK (role IN ('current', 'history', 'candidate', 'expired')),
+          storage_name  TEXT NOT NULL,
+          original_name TEXT NOT NULL,
+          mime_type     TEXT,
+          size_bytes    INTEGER NOT NULL,
+          duration_ms   INTEGER NOT NULL CHECK (duration_ms > 0),
+          created_at    INTEGER NOT NULL,
+          expires_at    INTEGER,
+          UNIQUE (video_id, media_revision)
+        );
+      `);
+      createIndexIfMissing(db, 'idx_media_assets_video',
+        'CREATE INDEX idx_media_assets_video ON media_assets(video_id, media_revision)');
+      addColumnIfMissing(db, 'videos', 'media_revision', 'INTEGER NOT NULL DEFAULT 1');
+      addColumnIfMissing(db, 'publications', 'media_revision', 'INTEGER NOT NULL DEFAULT 1');
+
+      // 回填：每个已有视频的当前（也是首个）媒体版次 = 修订号 1；
+      // 升级前发布的版本统一固定在修订号 1。回填幂等：已存在该视频的资产行则跳过。
+      const videos = db.prepare('SELECT id, storage_name, original_name, mime_type, size_bytes, duration_ms, created_at FROM videos').all();
+      for (const v of videos) {
+        const exists = db.prepare('SELECT 1 FROM media_assets WHERE video_id = ? AND media_revision = 1').get(v.id);
+        if (!exists) {
+          db.prepare(
+            `INSERT INTO media_assets (video_id, media_revision, role, storage_name, original_name,
+               mime_type, size_bytes, duration_ms, created_at, expires_at)
+             VALUES (?, 1, 'current', ?, ?, ?, ?, ?, ?, NULL)`
+          ).run(v.id, v.storage_name, v.original_name, v.mime_type, v.size_bytes, v.duration_ms, v.created_at);
+        }
+      }
+    },
+  },
 ];
 
 module.exports = { migrations };
